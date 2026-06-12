@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "next dev -p 3100",
     "build": "next build",
-    "start": "next start -p 3100",
+    "start": "next start -p ${PORT:-3100}",
     "lint": "next lint",
     "setup": "tsx scripts/setup-vonage.ts",
     "import": "tsx scripts/import-leads.ts",

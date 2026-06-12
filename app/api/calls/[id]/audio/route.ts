@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import { getDb } from "@/lib/db";
+import { config } from "@/lib/config";
 import { processCall } from "@/lib/intelligence";
 
 export const dynamic = "force-dynamic";
@@ -16,7 +17,7 @@ export async function POST(req: Request, { params }: { params: { id: string } })
   const buf = Buffer.from(await req.arrayBuffer());
   if (buf.length === 0) return NextResponse.json({ error: "empty body" }, { status: 400 });
 
-  const dir = path.join(process.cwd(), "data", "recordings");
+  const dir = config.recordingsDir;
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `call-${callId}.webm`);
   fs.writeFileSync(file, buf);

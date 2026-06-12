@@ -25,6 +25,10 @@ function env(key: string, fallback = ""): string {
   return process.env[key] || local[key] || workspace[key] || fallback;
 }
 
+/** Base data dir (DB + recordings). Override via DIALER_DATA_DIR for hosts with a
+ *  mounted persistent disk (Render: /var/data). Defaults keep local behavior identical. */
+const dataDir = env("DIALER_DATA_DIR", path.join(process.cwd(), "data"));
+
 export const config = {
   vonageApiKey: env("VONAGE_REAL_KEY") || env("VONAGE_API_KEY"),
   vonageApiSecret: env("VONAGE_API_SECRET"),
@@ -43,7 +47,9 @@ export const config = {
   vonageApiHost: env("VONAGE_API_HOST", "https://api-us-3.vonage.com"),
   /** Albert's mobile — leg A of every session. */
   operatorPhone: env("OPERATOR_PHONE"),
-  dbPath: env("DIALER_DB", path.join(process.cwd(), "data", "dialer.db")),
+  dataDir,
+  dbPath: env("DIALER_DB", path.join(dataDir, "dialer.db")),
+  recordingsDir: env("DIALER_RECORDINGS_DIR", path.join(dataDir, "recordings")),
   /* Call intelligence — OpenRouter preferred (OPENAI_API_KEY is dead as of 2026-06-12) */
   openaiApiKey: env("OPENAI_API_KEY"),
   openrouterApiKey: env("OPENROUTER_API_KEY"),
@@ -79,6 +85,9 @@ export function callerIdForCountry(country?: string | null, override?: "US" | "S
 }
 
 export function privateKey(): string {
+  // Hosted fallback: base64 env var (for platforms where a secret FILE is awkward).
+  const b64 = env("VONAGE_PRIVATE_KEY_B64");
+  if (b64) return Buffer.from(b64, "base64").toString("utf8");
   return fs.readFileSync(config.privateKeyPath, "utf8");
 }
 
@@ -86,7 +95,7 @@ export function assertCallReady(): string | null {
   if (!config.vonageApiKey || !config.vonageApiSecret)
     return "Missing VONAGE_API_KEY / VONAGE_API_SECRET";
   if (!config.applicationId) return "Missing VONAGE_APPLICATION_ID — run: npm run setup";
-  if (!fs.existsSync(config.privateKeyPath))
+  if (!env("VONAGE_PRIVATE_KEY_B64") && !fs.existsSync(config.privateKeyPath))
     return `Missing private key at ${config.privateKeyPath} — run: npm run setup`;
   if (!config.operatorPhone)
     return "Missing OPERATOR_PHONE in .env.local (your mobile, E.164 e.g. +467XXXXXXXX)";
