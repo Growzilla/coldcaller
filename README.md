@@ -1,36 +1,78 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# RapidDial — Growzilla cold-calling cockpit
 
-## Getting Started
+Single-operator power dialer. You answer one call at session start and stay on the line;
+every lead is then bridged into your live call. Talk on your own phone — no headset, no WebRTC.
 
-First, run the development server:
+## Architecture
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+ Your mobile (OPERATOR_PHONE)              Lead's phone
+        ▲ leg A (answer once)                   ▲ leg B (per lead)
+        │ from: +46790952801 (caller ID)        │ from: +46790952801
+        └────────────┐            ┌─────────────┘
+                  VONAGE ── named conversation per session ──
+                     ▲ REST (JWT) + 1s status polling — NO webhooks/tunnel
+                     ▼
+              Next.js (localhost:3100) · SQLite · SSE → cockpit
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Setup (one-time)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+1. Put credentials in `/home/god0fm0ney/dev/.env` (shared) or `.env.local` (this app):
+   - `VONAGE_API_KEY` — 8-char key from dashboard.vonage.com → API settings
+   - `VONAGE_API_SECRET` — the secret next to it
+2. `npm run setup` — verifies creds, creates the Voice application
+   (`secrets/private.key`), confirms the LVN, writes `VONAGE_APPLICATION_ID` to `.env.local`.
+3. Add `OPERATOR_PHONE=+467XXXXXXXX` (your mobile, E.164) to `.env.local`.
+4. `npm run test-call` — rings your phone; add a second number to test the full bridge:
+   `npm run test-call -- +46XXXXXXXXX`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Daily use
 
-## Learn More
+```bash
+npm run dev          # cockpit at http://localhost:3100
+npm run import       # (re)import Sweden ecom CSVs + call-log callbacks — idempotent
+npm run export-log   # append today's outcomes to growzillaAssets CALL-LOG-YYYY-MM-DD.md
+```
 
-To learn more about Next.js, take a look at the following resources:
+In the cockpit: **Start line** → answer your phone once → you're live for the whole session.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Key | Action |
+|-----|--------|
+| `C` | Call current lead |
+| `H` | Hang up lead (you stay on the line) |
+| `1–5` | Outcome: no answer / callback / interested / not interested / bad number |
+| `Enter` | Save outcome + next lead |
+| `S` | Skip lead |
+| `U` | Undo last wrapup |
+| `B` | Email the lead your booking link (Resend, mid-call) |
+| `O` / `L` | Open website / LinkedIn |
+| `N` | Focus notes |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Call intelligence (browser-line sessions)
 
-## Deploy on Vercel
+Every answered call is recorded in the browser (mic + remote mixed), uploaded on hangup,
+transcribed (Whisper) and analyzed (GPT): summary, action items, interest 1–5, objections.
+Intel appears in the cockpit ~20s after each call. `npm run digest` writes the full session
+digest (aggregated action items + transcripts) to `growzillaAssets/sales/leads/DIGEST-*.md`.
+Booked-meeting detection activates when `CALENDLY_TOKEN` is set in `.env.local`.
+Browser line needs `npm run tunnel` running (self-configures Vonage webhooks).
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Import any Apollo-style CSV via the header button (schema auto-detected) or
+`npm run import -- path/to/file.csv`.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Data
+
+SQLite at `data/dialer.db` — tables `leads`, `calls`, `sessions`.
+Queue order: priority 0 (callbacks due, parsed from CALL-LOG markdown) → 1 (high-value) → 2.
+
+## Compliance (Sweden)
+
+B2B cold calling is permitted. NIX-Telefon covers consumers — skip obvious sole traders
+(enskild firma) or check nixtelefon.org. Lawful basis: legitimate interest (B2B outreach).
+No call recording (keeps GDPR surface minimal).
+
+## Cost
+
+Two concurrent legs ≈ €0.04–0.08/min total to Swedish mobiles. Balance shows in the header;
+calls are blocked under €1.

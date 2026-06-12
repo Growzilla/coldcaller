@@ -3,22 +3,36 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3100",
     "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+    "start": "next start -p 3100",
+    "lint": "next lint",
+    "setup": "tsx scripts/setup-vonage.ts",
+    "import": "tsx scripts/import-leads.ts",
+    "test-call": "tsx scripts/test-call.ts",
+    "export-log": "tsx scripts/export-call-log.ts",
+    "tunnel": "tsx scripts/tunnel.ts",
+    "digest": "tsx scripts/digest.ts"
   },
   "dependencies": {
+    "@vonage/client-sdk": "^2.3.1",
+    "@vonage/jwt": "^1.14.0",
+    "@vonage/server-sdk": "^3.27.0",
+    "better-sqlite3": "^12.10.0",
+    "csv-parse": "^6.2.1",
+    "next": "14.2.35",
     "react": "^18",
-    "react-dom": "^18",
-    "next": "14.2.35"
+    "react-dom": "^18"
   },
   "devDependencies": {
-    "typescript": "^5",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "postcss": "^8",
-    "tailwindcss": "^3.4.1"
+    "puppeteer-core": "^24.43.1",
+    "tailwindcss": "^3.4.1",
+    "tsx": "^4.22.4",
+    "typescript": "^5"
   }
 }
