@@ -690,6 +690,23 @@ export default function Cockpit() {
     setDtmfSent("");
     api("/api/call", { leadId: l.id }).catch(() => {});
   }, [api]);
+
+  // Ad-hoc dial: any number, queue or not. Server creates/reuses a minimal lead row so
+  // wrapup, recording, and intel all work; the card swaps to it like the inbound path does.
+  const [manualNumber, setManualNumber] = useState("");
+  const manualDial = useCallback(() => {
+    const n = manualNumber.trim();
+    if (!n) return;
+    setOutcome(null);
+    setNotes("");
+    setDtmfSent("");
+    api("/api/call", { number: n })
+      .then((d) => {
+        if (d.lead) setLead(d.lead);
+        setManualNumber("");
+      })
+      .catch(() => {});
+  }, [api, manualNumber]);
   const hangup = useCallback(() => api("/api/hangup").catch(() => {}), [api]);
 
   const sendBooking = useCallback(() => {
@@ -1023,6 +1040,31 @@ export default function Cockpit() {
       <main className="grid grid-cols-[1fr_280px] gap-0">
         {/* Lead card + call controls */}
         <section className="flex min-h-[calc(100vh-49px)] flex-col gap-4 p-6">
+          {/* Manual dial — call any number, queue or not */}
+          <div className="flex items-center gap-2">
+            <input
+              value={manualNumber}
+              onChange={(e) => setManualNumber(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation(); // keep global hotkeys (Enter→saveOutcome, P→dial) out of this field
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  manualDial();
+                }
+                if (e.key === "Escape") (e.target as HTMLElement).blur();
+              }}
+              placeholder="Dial any number… +46 / 07x / +1"
+              className="w-60 rounded border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+            />
+            <button
+              onClick={manualDial}
+              disabled={!sessionLive || callActive || !manualNumber.trim()}
+              className="rounded border border-emerald-800 px-3 py-1.5 text-sm text-emerald-300 hover:bg-emerald-950 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:text-zinc-600"
+              title={sessionLive ? "Dial this number into the live line" : "Start the line first"}
+            >
+              ☎ Call number
+            </button>
+          </div>
           {lead ? (
             <>
               <div>
