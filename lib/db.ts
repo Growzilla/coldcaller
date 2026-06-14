@@ -200,3 +200,54 @@ export function activeCall(): (CallRow & { company: string }) | undefined {
     )
     .get() as (CallRow & { company: string }) | undefined;
 }
+
+// ── Hermes read-access helpers (CRM-memory feed for the always-on agent) ─────────────
+// Read-only queries over the existing SQLite so HermesAgent can see the queue, call
+// outcomes + transcripts, and per-lead history. Used by the bearer-authed /api/leads/*
+// and /api/calls/* read routes. No writes here.
+
+export type RecentCall = CallRow & {
+  company: string;
+  first_name: string | null;
+  last_name: string | null;
+  phone_e164: string | null;
+};
+
+/** Recent calls joined with lead identity — Hermes's call-memory feed (outcome, duration,
+ *  transcript, analysis). `sinceId` lets Hermes poll only what's new since its last read. */
+export function recentCalls(limit = 50, sinceId = 0): RecentCall[] {
+  const lim = Math.min(Math.max(limit, 1), 500);
+  return getDb()
+    .prepare(
+      `SELECT c.*, l.company, l.first_name, l.last_name, l.phone_e164
+       FROM calls c JOIN leads l ON l.id = c.lead_id
+       WHERE c.id > ? ORDER BY c.id DESC LIMIT ?`
+    )
+    .all(sinceId, lim) as RecentCall[];
+}
+
+/** One lead plus its full call history — the "what happened to this prospect" view. */
+export function leadTimeline(leadId: number): { lead: Lead | undefined; calls: CallRow[] } {
+  const db = getDb();
+  const lead = db.prepare("SELECT * FROM leads WHERE id = ?").get(leadId) as Lead | undefined;
+  const calls = lead
+    ? (db.prepare("SELECT * FROM calls WHERE lead_id = ? ORDER BY id ASC").all(leadId) as CallRow[])
+    : [];
+  return { lead, calls };
+}
+
+/** Filtered lead list for Hermes — by status / country / source, newest first. */
+export function listLeads(
+  opts: { status?: string | null; country?: string | null; source?: string | null; limit?: number } = {}
+): Lead[] {
+  const where: string[] = [];
+  const args: (string | number)[] = [];
+  if (opts.status) { where.push("status = ?"); args.push(opts.status); }
+  if (opts.country) { where.push("country = ?"); args.push(opts.country); }
+  if (opts.source) { where.push("source_file = ?"); args.push(opts.source); }
+  const clause = where.length ? "WHERE " + where.join(" AND ") : "";
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+  return getDb()
+    .prepare(`SELECT * FROM leads ${clause} ORDER BY id DESC LIMIT ?`)
+    .all(...args, limit) as Lead[];
+}
