@@ -813,7 +813,7 @@ export default function Cockpit() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-[family-name:var(--font-geist-sans)]">
       {/* Header */}
-      <header className="flex items-center gap-4 border-b border-zinc-800 px-5 py-3 text-sm">
+      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800 px-5 py-3 text-sm">
         <span className="font-semibold tracking-tight">RapidDial</span>
         <span className="flex items-center gap-1.5">
           <span
@@ -1037,7 +1037,7 @@ export default function Cockpit() {
         </div>
       )}
 
-      <main className="grid grid-cols-[1fr_280px] gap-0">
+      <main className="grid grid-cols-1 md:grid-cols-[1fr_280px] gap-0">
         {/* Lead card + call controls */}
         <section className="flex min-h-[calc(100vh-49px)] flex-col gap-4 p-6">
           {/* Manual dial — call any number, queue or not */}
@@ -1224,7 +1224,7 @@ export default function Cockpit() {
         </section>
 
         {/* Queue sidebar */}
-        <aside className="border-l border-zinc-800 p-4">
+        <aside className="border-t border-zinc-800 p-4 md:border-l md:border-t-0">
           <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-zinc-500">Up next</h2>
           <ul className="space-y-1.5">
             {queue.map((q, i) => (
