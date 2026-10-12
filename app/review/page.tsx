@@ -2,7 +2,7 @@
 
 /**
  * Lead review — sourcing mode. No calling: look at each prospect, judge it, move on.
- * Keyboard: 1 good · 2 maybe · 3 bad · S skip · U undo last · Enter open site · G/N/D/O/M/B/W/X chips
+ * Keyboard: 1 good · 2 maybe · 3 bad · S skip · U undo last · Enter open site · G/N/E/D/O/M/B/W/X chips
  * · / note · Esc leave the note. Verdicts teach the "learned" order and sync to GHL at the end.
  */
 import { useCallback, useEffect, useRef, useState } from "react";

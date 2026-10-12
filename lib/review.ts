@@ -24,6 +24,7 @@ export type Verdict = (typeof VERDICTS)[number];
 export const CHIPS: { key: string; hotkey: string; label: string }[] = [
   { key: "has-gbp", hotkey: "g", label: "Has GBP" },
   { key: "no-gbp", hotkey: "n", label: "No GBP" },
+  { key: "no-site", hotkey: "e", label: "No site" },
   { key: "dead-site", hotkey: "d", label: "Dead/broken site" },
   { key: "old-site", hotkey: "o", label: "Old/dated site" },
   { key: "good-site", hotkey: "m", label: "Site is fine" },
@@ -535,8 +536,8 @@ export function writeImportFile(dir = path.join(process.cwd(), "data", "review")
       alt_phone: p.alt_phone ?? "",
       phone_is_mobile: !!p.phone_is_mobile,
       email: p.email ?? "",
-      website: p.presence === "dead" ? "" : p.website ?? "",
-      website_status: p.presence === "none" || p.presence === "dead" ? "none" : "weak",
+      website: p.presence === "dead" || chips.includes("no-site") ? "" : p.website ?? "",
+      website_status: p.presence === "none" || p.presence === "dead" || chips.includes("no-site") ? "none" : "weak",
       street: p.street ?? "",
       postcode: p.postcode ?? "",
       city: p.city ?? "",
@@ -562,6 +563,7 @@ function chipsFromNote(note: string): string[] {
   const out: string[] = [];
   if (/(clean|good|goo|great|new|fine)\b[^.]{0,12}(site|website)|(site|website)[^.]{0,12}(clean|new|good|goo)\b|clearly new/.test(n)) out.push("good-site");
   if (/(shitty|poor|old|dated|bad)[^.]{0,12}(site|website)|no online/.test(n)) out.push("old-site");
+  if (/\bno (web)?site|no website|har ingen (hemsida|webb)/.test(n)) out.push("no-site");
   if (/not[^.]{0,8}trade|\bdq\b|not relevant/.test(n)) out.push("wrong-niche");
   if (/\d+\+? ?reviews/.test(n)) out.push("has-gbp");
   return out;
