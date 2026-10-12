@@ -216,6 +216,22 @@ export default function ReviewPage() {
       );
     load();
   };
+  const rank = async () => {
+    const res = await fetch("/api/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...filters(), action: "rank" }),
+    });
+    const d = await res.json();
+    if (d.error) return setMsg(d.error);
+    apply(d);
+    const r = d.ranked;
+    setMsg(
+      `Dialer feedback → ${r.calls.good} good, ${r.calls.bad} bad${r.calls.kept ? ` (${r.calls.kept} kept your /review verdict)` : ""}. ` +
+        `Ranked ${r.ranked}${r.learned ? " with the learned pattern" : " (v2 only — need 8 good + 8 bad to learn)"}: ` +
+        `${r.requeuedGood} good leads moved to the top of the dial queue, ${r.removedBad} bad ones taken out.`
+    );
+  };
   const exportNew = async () => {
     const r = await (await fetch("/api/review/export", { method: "POST" })).json();
     setMsg(r.rows ? `${r.rows} new leads → ${r.file}\nImport: ${r.command}\nThen Sync again to add the review tags.` : "No good/maybe leads outside GHL yet.");
@@ -402,7 +418,8 @@ export default function ReviewPage() {
             <p className="mt-1 text-xs text-zinc-500">
               Sync tags review-good/maybe/bad + your labels, sets ICP Score (good → top of the dial queue, bad → bottom) and GBP Status. Leads not in GHL yet: export, import, then sync.
             </p>
-            <div className="mt-2 flex gap-2">
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button onClick={rank} className="rounded bg-emerald-700 px-3 py-1.5 text-white hover:bg-emerald-600" title="pull verdicts from dialer wrapups, re-rank everything, reorder the dial queue (local, no GHL calls)">Apply to dial queue</button>
               <button onClick={sync} disabled={!plan?.pending} className="rounded bg-sky-700 px-3 py-1.5 text-white hover:bg-sky-600 disabled:opacity-40">Sync to GHL</button>
               <button onClick={exportNew} className="rounded border border-zinc-700 px-3 py-1.5 text-zinc-300 hover:bg-zinc-900">Export new leads</button>
             </div>

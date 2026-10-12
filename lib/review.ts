@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS ghl_phone_map (phone TEXT PRIMARY KEY, contact_id TEX
 export function reviewDb() {
   const db = getDb();
   db.exec(SCHEMA);
+  const cols = (db.pragma("table_info(prospects)") as { name: string }[]).map((c) => c.name);
+  // rank_score = the dial order this review produces (see applyRanking); lib/ghl enrichScores prefers it
+  if (!cols.includes("rank_score")) db.exec("ALTER TABLE prospects ADD COLUMN rank_score INTEGER");
   return db;
 }
 
@@ -341,7 +344,7 @@ export function features(p: Prospect): string[] {
     `age: ${ageBucket(p.years)}`,
     `site: ${p.presence}`,
     `area: ${p.metro || "small town"}`,
-    `type: ${p.company_type === "EF" ? "sole trader" : "AB/company"}`,
+    `form: ${companyForm(p)}`,
     `email: ${p.email ? "yes" : "no"}`,
     `phone: ${p.phone_is_mobile ? "mobile" : "landline"}`,
   ];
@@ -352,7 +355,17 @@ export function features(p: Prospect): string[] {
     if (r.includes(needle)) f.push(`site has: ${label}`);
   }
   if (/©20(2[3-9])/.test(p.v2_reasons)) f.push("site has: recent ©");
+  // registry purpose listing many unrelated activities (bemanning, städ, import…) = not a pure trade
+  if (p.description && p.description.split(/[,.;]| och /).filter((x) => x.trim().length > 3).length >= 5) f.push("purpose: many activities");
   return f;
+}
+
+function companyForm(p: Prospect): string {
+  const t = p.company_type ?? "";
+  if (t === "EF") return "sole trader";
+  if (t === "HB" || t === "KB" || /\b(handelsbolag|kommanditbolag|hb|kb)$/i.test(p.company.trim())) return "HB/KB";
+  if (t === "AB" || /\b(ab|aktiebolag)\b/i.test(p.company)) return "AB";
+  return "other";
 }
 
 export type Pattern = { feature: string; n: number; good: number; maybe: number; bad: number; goodRate: number; lift: number };
@@ -539,4 +552,92 @@ export function writeImportFile(dir = path.join(process.cwd(), "data", "review")
   });
   fs.writeFileSync(file, lines.join("\n") + (lines.length ? "\n" : ""), { mode: 0o600 });
   return { file, rows: rows.length };
+}
+
+// ── Feedback from the dialer + the resulting dial order ──────────────────
+
+/** Labels inferred from a wrapup note ("very clean site", "DQ not trade", "500+ reviews"…). */
+function chipsFromNote(note: string): string[] {
+  const n = note.toLowerCase();
+  const out: string[] = [];
+  if (/(clean|good|goo|great|new|fine)\b[^.]{0,12}(site|website)|(site|website)[^.]{0,12}(clean|new|good|goo)\b|clearly new/.test(n)) out.push("good-site");
+  if (/(shitty|poor|old|dated|bad)[^.]{0,12}(site|website)|no online/.test(n)) out.push("old-site");
+  if (/not[^.]{0,8}trade|\bdq\b|not relevant/.test(n)) out.push("wrong-niche");
+  if (/\d+\+? ?reviews/.test(n)) out.push("has-gbp");
+  return out;
+}
+
+/**
+ * Turn dialer wrapups on prospects into verdicts: callback / interested / booked = good; a
+ * "bad number" WITH a note is how Albert disqualifies a lead from the cockpit (DQ, not trade,
+ * clean site) = bad. A verdict given on /review is never overwritten.
+ */
+export function importCallFeedback(): { good: number; bad: number; kept: number } {
+  const db = reviewDb();
+  const rows = db
+    .prepare(
+      `SELECT l.phone_e164 phone, c.outcome, c.notes, c.started_at FROM calls c JOIN leads l ON l.id=c.lead_id
+       WHERE c.outcome IS NOT NULL AND l.phone_e164 IS NOT NULL ORDER BY c.id`
+    )
+    .all() as { phone: string; outcome: string; notes: string | null; started_at: string }[];
+  // every note on the lead, verdict from the latest call
+  const byPhone = new Map<string, { outcome: string; notes: string[]; at: string }>();
+  for (const r of rows) {
+    const e = byPhone.get(r.phone) ?? { outcome: r.outcome, notes: [], at: r.started_at };
+    e.outcome = r.outcome;
+    e.at = r.started_at;
+    if (r.notes?.trim()) e.notes.push(r.notes.trim());
+    byPhone.set(r.phone, e);
+  }
+  const get = db.prepare("SELECT id, verdict, reviewed_at, note FROM prospects WHERE phone=?");
+  const set = db.prepare("UPDATE prospects SET verdict=?, chips=?, note=?, reviewed_at=?, skipped_at=NULL WHERE id=?");
+  const keepNote = db.prepare("UPDATE prospects SET chips=?, note=? WHERE id=? AND note IS NULL");
+  const res = { good: 0, bad: 0, kept: 0 };
+  db.transaction(() => {
+    for (const [phone, e] of byPhone) {
+      const p = get.get(phone) as { id: number; verdict: string | null; reviewed_at: string | null; note: string | null } | undefined;
+      if (!p) continue;
+      const note = e.notes.join(" / ");
+      const v = ["callback", "interested", "booked"].includes(e.outcome) ? "good" : e.outcome === "bad_number" && note ? "bad" : null;
+      if (!v) continue;
+      // hand review wins when it's newer than the call — but keep what the call note says
+      if (p.verdict && p.reviewed_at && p.reviewed_at > e.at) {
+        if (!p.note && note) keepNote.run(JSON.stringify(chipsFromNote(note)), `📞 ${note}`.slice(0, 1000), p.id);
+        res.kept++;
+        continue;
+      }
+      set.run(v, JSON.stringify(chipsFromNote(note)), `📞 ${note}`.slice(0, 1000), e.at, p.id);
+      res[v]++;
+    }
+  })();
+  return res;
+}
+
+/**
+ * Write the review's dial order: said-good first (100 + v2), said-bad out (0), everyone else
+ * v2 nudged by what the verdicts have in common (±15 once the model is ready). Mirrors it onto
+ * the local dialer queue: good leads go back in at priority 0, bad ones leave it.
+ */
+export function applyRanking(): { ranked: number; delta: boolean; requeuedGood: number; removedBad: number; model: Model } {
+  const db = reviewDb();
+  const model = buildModel(allReviewed());
+  const all = db.prepare("SELECT * FROM prospects").all() as Prospect[];
+  const setRank = db.prepare("UPDATE prospects SET rank_score=? WHERE id=?");
+  const leadScore = db.prepare("UPDATE leads SET score=? WHERE phone_e164=?");
+  const requeue = db.prepare("UPDATE leads SET status='queued', priority=0 WHERE phone_e164=? AND status IN ('done','queued') AND (status!='queued' OR priority!=0)");
+  const drop = db.prepare("UPDATE leads SET status='review_bad' WHERE phone_e164=? AND status IN ('queued','done')");
+  let requeuedGood = 0, removedBad = 0;
+  db.transaction(() => {
+    for (const p of all) {
+      const fixed = reviewedScore(p);
+      // v2 (0–100) ± 15, squeezed back into 1–99 so it never ties with or passes a said-good lead
+      const nudged = p.v2 + (model.ready ? 30 * (model.predict(p) - 0.5) : 0);
+      const rank = fixed ?? Math.max(1, Math.round((nudged + 15) * (98 / 130)) + 1);
+      setRank.run(rank, p.id);
+      leadScore.run(rank, p.phone);
+      if (p.verdict === "good") requeuedGood += requeue.run(p.phone).changes;
+      if (p.verdict === "bad") removedBad += drop.run(p.phone).changes;
+    }
+  })();
+  return { ranked: all.length, delta: model.ready, requeuedGood, removedBad, model };
 }

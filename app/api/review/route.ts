@@ -3,9 +3,11 @@ import {
   CHIPS,
   VERDICTS,
   allReviewed,
+  applyRanking,
   buildModel,
   counts,
   features,
+  importCallFeedback,
   lastReviewed,
   queue,
   setVerdict,
@@ -65,9 +67,17 @@ export async function GET(req: Request) {
   return NextResponse.json(state(q.get("order") === "learned" ? "learned" : "v2", filterFrom({ source: q.get("source"), ghl: q.get("ghl") })));
 }
 
-/** {action: "verdict", id, verdict, chips, note} · {action: "skip", id} · {action: "undo", id} */
+/** {action: "verdict", id, verdict, chips, note} · {action: "skip", id} · {action: "undo", id} · {action: "rank"} */
 export async function POST(req: Request) {
   const b = await req.json().catch(() => ({} as any));
+  if (b.action === "rank") {
+    const calls = importCallFeedback();
+    const r = applyRanking();
+    return NextResponse.json({
+      ...state(b.order === "learned" ? "learned" : "v2", filterFrom(b)),
+      ranked: { calls, ranked: r.ranked, learned: r.delta, requeuedGood: r.requeuedGood, removedBad: r.removedBad },
+    });
+  }
   const id = Number(b.id);
   if (!Number.isInteger(id)) return NextResponse.json({ error: "id required" }, { status: 400 });
   if (b.action === "verdict") {
