@@ -39,7 +39,7 @@ export function lastQuota(): Quota | null {
 }
 
 let last = 0;
-async function ghl<T = any>(method: string, path: string, body?: unknown): Promise<T> {
+export async function ghl<T = any>(method: string, path: string, body?: unknown): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     const wait = last + 450 - Date.now(); // 25 req / 10 s burst limit, leave room for the dialer
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
@@ -70,7 +70,7 @@ async function ghl<T = any>(method: string, path: string, body?: unknown): Promi
 }
 
 /** phone → contact id for every contact in the location (≈1 request per 100 contacts). */
-async function refreshPhoneMap(): Promise<number> {
+export async function refreshPhoneMap(): Promise<number> {
   const db = reviewDb();
   const upsert = db.prepare(
     "INSERT INTO ghl_phone_map(phone, contact_id, tags, fetched_at) VALUES(?, ?, ?, datetime('now')) ON CONFLICT(phone) DO UPDATE SET contact_id=excluded.contact_id, tags=excluded.tags, fetched_at=excluded.fetched_at"

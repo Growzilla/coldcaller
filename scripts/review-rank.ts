@@ -4,10 +4,12 @@
  *
  *   npm run review:rank
  */
-import { applyRanking, importCallFeedback } from "../lib/review";
+import { applyRanking, flagWrongSiteVerdicts, importCallFeedback } from "../lib/review";
 
 const calls = importCallFeedback();
 console.log(`dialer feedback: ${calls.good} good, ${calls.bad} bad, ${calls.kept} kept from /review`);
+const recheck = flagWrongSiteVerdicts();
+if (recheck) console.log(`${recheck} bad verdicts were given on a website that isn't theirs → back in the review queue (first in line)`);
 const r = applyRanking();
 const m = r.model;
 console.log(`verdicts: ${m.good} good · ${m.maybe} maybe · ${m.bad} bad — learned pattern ${r.delta ? "ON" : "off (need 8 good + 8 bad)"}`);

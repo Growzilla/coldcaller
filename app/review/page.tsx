@@ -37,6 +37,15 @@ type Card = {
   note: string | null;
   fit?: number | null;
   features: string[];
+  site_status?: string | null;
+  site_url?: string | null;
+  site_evidence?: string | null;
+  website_orig?: string | null;
+  email_suspect?: number | null;
+  recheck?: number | null;
+  prev_verdict?: string | null;
+  v2c: number;
+  v2c_reasons: string;
 };
 type Pattern = { feature: string; n: number; good: number; maybe: number; bad: number; goodRate: number; lift: number };
 type State = {
@@ -162,8 +171,13 @@ export default function ReviewPage() {
   const undo = useCallback(() => st?.last && post({ action: "undo", id: st.last.id }), [st?.last, post]);
   const toggleChip = useCallback((k: string) => setChips((c) => (c.includes(k) ? c.filter((x) => x !== k) : [...c, k])), []);
 
-  const site = cur?.website || null;
-  const altSite = cur ? siteFromEmail(cur.email, cur.website) : null;
+  // Only a site PROVEN to be theirs (lib/site-verify) is shown as their website; the listed guess is
+  // shown separately, flagged, so a wrong domain can't be mistaken for theirs again.
+  const checked = Boolean(cur?.site_status);
+  const site = checked ? cur?.site_url || null : cur?.website || null;
+  const listed = cur?.website_orig || cur?.website || null;
+  const listedWrong = checked && listed && !(cur?.site_url && cur.site_url.includes(listed.replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0]));
+  const altSite = cur && !checked ? siteFromEmail(cur.email, cur.website) : null;
   const openSite = useCallback(() => {
     const u = site || altSite;
     if (u) window.open(u, "_blank", "noopener");
@@ -299,7 +313,7 @@ export default function ReviewPage() {
                   <h1 className="text-2xl font-semibold">{cur.company}</h1>
                   <span className="text-zinc-400">{titleCase(cur.city)}{cur.postcode ? ` · ${cur.postcode}` : ""}</span>
                   <span className="ml-auto rounded bg-zinc-800 px-2 py-0.5 text-sm">
-                    v2 <b>{cur.v2}</b>
+                    v2 <b>{cur.v2c}</b>{cur.v2c !== cur.v2 && <span className="text-zinc-500"> (was {cur.v2})</span>}
                     {cur.fit != null && <> · fit <b>{Math.round(cur.fit * 100)}%</b></>}
                   </span>
                 </div>
@@ -313,15 +327,30 @@ export default function ReviewPage() {
                     {cur.in_ghl ? "in GHL" : "new"} · {cur.sources}
                   </span>
                 </div>
-                <p className="mt-2 text-sm text-zinc-400">{cur.v2_reasons}{cur.evidence && cur.evidence !== cur.v2_reasons ? ` · ${cur.evidence}` : ""}</p>
+                {cur.recheck ? (
+                  <p className="mt-2 rounded bg-amber-900/40 px-2 py-1 text-sm text-amber-200">
+                    Second look: you rated this <b>{cur.prev_verdict}</b> while the card showed a website that isn&apos;t theirs.
+                  </p>
+                ) : null}
+                <p className="mt-2 text-sm text-zinc-400">{cur.v2c_reasons}{cur.evidence && cur.evidence !== cur.v2_reasons && !checked ? ` · ${cur.evidence}` : ""}</p>
+                {checked && (
+                  <p className={`mt-1 text-xs ${site ? "text-emerald-400" : "text-amber-300"}`}>
+                    {site ? "✓ site confirmed theirs" : "⚠ no website of their own found"} — {cur.site_evidence}
+                  </p>
+                )}
                 {cur.description && <p className="mt-1 line-clamp-2 text-xs text-zinc-500">{cur.description}</p>}
                 <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-sm">
                   <span className="font-mono text-zinc-300">{cur.phone}{cur.alt_phone ? ` · ${cur.alt_phone}` : ""}</span>
-                  {cur.email && <span className="text-zinc-400">{cur.email}</span>}
+                  {cur.email && <span className={cur.email_suspect ? "text-amber-300 line-through" : "text-zinc-400"} title={cur.email_suspect ? "email is on the domain of a site that isn't theirs" : ""}>{cur.email}</span>}
                   {cur.org_number && <span className="font-mono text-zinc-500">{cur.org_number}</span>}
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2 text-sm">
                   {site && <a href={site} target="_blank" rel="noopener" className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-800">🌐 {site.replace(/^https?:\/\//, "")} ↗</a>}
+                  {listedWrong && (
+                    <a href={listed!} target="_blank" rel="noopener" className="rounded border border-amber-800 px-2 py-1 text-amber-300 line-through decoration-amber-600 hover:bg-zinc-800" title="the domain we had on file — it is NOT theirs">
+                      {listed!.replace(/^https?:\/\//, "")} (not theirs) ↗
+                    </a>
+                  )}
                   {altSite && <a href={altSite} target="_blank" rel="noopener" className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-800" title="domain from their email">✉️ {altSite.replace(/^https:\/\//, "")} ↗</a>}
                   <a href={`https://www.google.com/search?q=${q}`} target="_blank" rel="noopener" className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-800">Google (GBP panel) ↗</a>
                   <a href={`https://www.google.com/maps/search/${q}`} target="_blank" rel="noopener" className="rounded border border-zinc-700 px-2 py-1 hover:bg-zinc-800">Maps ↗</a>
@@ -368,7 +397,7 @@ export default function ReviewPage() {
                   <iframe key={site} src={site} className="h-full w-full" sandbox="allow-scripts allow-same-origin" referrerPolicy="no-referrer" />
                 ) : (
                   <div className="flex h-full items-center justify-center bg-zinc-900 text-sm text-zinc-500">
-                    {!site ? "No website on file." : embeddable === null ? "Checking site…" : "This site can't be shown inline — press Enter to open it in a tab."}
+                    {!site ? (checked ? "No website of their own — a prime prospect if they're a real trade firm." : "No website on file.") : embeddable === null ? "Checking site…" : "This site can't be shown inline — press Enter to open it in a tab."}
                   </div>
                 )}
               </div>

@@ -3,6 +3,7 @@ import path from "path";
 import { parse } from "csv-parse/sync";
 import { getDb } from "./db";
 import { toE164 } from "./phone";
+import { hostOf } from "./site-verify";
 
 /**
  * Lead review ("sourcing mode"): go through prospects WITHOUT calling, judge each one
@@ -67,6 +68,15 @@ export type Prospect = {
   ghl_synced_verdict: string | null;
   ghl_synced_at: string | null;
   ghl_error: string | null;
+  // lib/site-verify (npm run review:sites)
+  site_status?: string | null;
+  site_url?: string | null;
+  site_evidence?: string | null;
+  email_suspect?: number | null;
+  website_orig?: string | null;
+  rank_score?: number | null;
+  recheck?: number | null;
+  prev_verdict?: string | null;
 };
 
 const SCHEMA = `
@@ -95,6 +105,10 @@ export function reviewDb() {
   const cols = (db.pragma("table_info(prospects)") as { name: string }[]).map((c) => c.name);
   // rank_score = the dial order this review produces (see applyRanking); lib/ghl enrichScores prefers it
   if (!cols.includes("rank_score")) db.exec("ALTER TABLE prospects ADD COLUMN rank_score INTEGER");
+  // lib/site-verify: is `website` really theirs? site_url = the URL we trust (null = none found)
+  for (const col of ["site_status TEXT", "site_url TEXT", "site_evidence TEXT", "site_checked_at TEXT", "email_suspect INTEGER DEFAULT 0", "website_orig TEXT", "recheck INTEGER DEFAULT 0", "prev_verdict TEXT"]) {
+    if (!cols.includes(col.split(" ")[0])) db.exec(`ALTER TABLE prospects ADD COLUMN ${col}`);
+  }
   return db;
 }
 
@@ -340,10 +354,43 @@ function ageBucket(y: number | null): string {
 const NICHE_LABEL: Record<string, string> = { mark: "markarbete", el_installator: "el", maleri: "måleri", brand: "brandskydd" };
 
 /** Traits known BEFORE review — the model learns which of these predict a good verdict. */
+/** Site verdict for scoring: the site flags (GTM, ©, pages) only describe them when the site is theirs. */
+export function siteState(p: Prospect): { trusted: boolean; sameSite: boolean; label: string } {
+  const st = p.site_status;
+  if (!st) return { trusted: true, sameSite: true, label: p.presence }; // not checked yet
+  const listed = hostOf(p.website_orig ?? p.website);
+  const trusted = st === "verified" || st === "likely";
+  const sameSite = trusted && !!p.site_url && hostOf(p.site_url) === listed;
+  if (trusted) return { trusted, sameSite, label: sameSite ? p.presence : "found via email/review (unscored)" };
+  if (st === "dead") return { trusted, sameSite, label: "dead" };
+  if (st === "parked") return { trusted, sameSite, label: "parked" };
+  return { trusted, sameSite, label: "none of their own" };
+}
+
+/**
+ * priority_v2 re-scored with the verified site: a lead whose listed site turned out to be someone
+ * else's has NO site of its own → full presence points (35); a site found via the email domain or
+ * the reviewer hasn't been fingerprinted → neutral 25. Age / location / trade parts are unchanged.
+ */
+export function correctedV2(p: Prospect): { v2: number; reasons: string } {
+  const s = siteState(p);
+  if (s.sameSite) return { v2: p.v2, reasons: p.v2_reasons };
+  const y = p.years;
+  const age = y == null ? 15 : y >= 30 ? 40 : y >= 20 ? 35 : y >= 15 ? 22 : y >= 10 ? 15 : y >= 5 ? 6 : 0;
+  const location = p.metro === "stockholm" ? 0 : p.metro ? 5 : 15;
+  const sni = (p.sni ?? p.v2_reasons.match(/SNI (\d+)/)?.[1] ?? "").trim();
+  const trade = sni ? (["41", "42", "43"].includes(sni.slice(0, 2)) ? 10 : 0) : p.sources.includes("export") ? 10 : 6;
+  const presence = s.trusted ? 25 : 35;
+  const why = [y == null ? "age ?" : `${Math.floor(y)}y`, s.trusted ? "real site found (unscored)" : `no own site (listed: ${s.label})`, p.metro || "small town"];
+  if (!trade && sni) why.push(`SNI ${sni}`);
+  return { v2: age + presence + location + trade, reasons: why.join(", ") };
+}
+
 export function features(p: Prospect): string[] {
+  const site = siteState(p);
   const f = [
     `age: ${ageBucket(p.years)}`,
-    `site: ${p.presence}`,
+    `site: ${site.label}`,
     `area: ${p.metro || "small town"}`,
     `form: ${companyForm(p)}`,
     `email: ${p.email ? "yes" : "no"}`,
@@ -351,11 +398,11 @@ export function features(p: Prospect): string[] {
   ];
   const trades: string[] = p.trades ? JSON.parse(p.trades) : [];
   f.push(`niche: ${trades.length ? NICHE_LABEL[trades[0]] ?? trades[0] : "other/unknown"}`);
-  const r = p.v2_reasons.toLowerCase();
+  const r = site.sameSite ? p.v2_reasons.toLowerCase() : "";
   for (const [needle, label] of [["gtm", "GTM"], ["pixel", "Meta pixel"], ["quote form", "quote form"], ["booking", "booking"], ["old ©", "old ©"], ["tiny site", "tiny site"], ["pages", "20+ pages"]] as const) {
     if (r.includes(needle)) f.push(`site has: ${label}`);
   }
-  if (/©20(2[3-9])/.test(p.v2_reasons)) f.push("site has: recent ©");
+  if (site.sameSite && /©20(2[3-9])/.test(p.v2_reasons)) f.push("site has: recent ©");
   // registry purpose listing many unrelated activities (bemanning, städ, import…) = not a pure trade
   if (p.description && p.description.split(/[,.;]| och /).filter((x) => x.trim().length > 3).length >= 5) f.push("purpose: many activities");
   return f;
@@ -462,11 +509,13 @@ export function queue(order: Order, f: Filter, model: Model, limit = 10): (Prosp
   const learned = order === "learned" && model.ready;
   const scored = rows.map((p) => ({ ...p, fit: model.ready ? model.predict(p) : null }));
   scored.sort((a, b) => {
+    const rc = Number(b.recheck ?? 0) - Number(a.recheck ?? 0); // verdicts given on the wrong website first
+    if (rc) return rc;
     const sk = Number(!!a.skipped_at) - Number(!!b.skipped_at);
     if (sk) return sk;
     if (a.skipped_at && b.skipped_at) return a.skipped_at.localeCompare(b.skipped_at);
     if (learned && a.fit !== b.fit) return (b.fit ?? 0) - (a.fit ?? 0);
-    return b.v2 - a.v2 || a.id - b.id;
+    return correctedV2(b).v2 - correctedV2(a).v2 || a.id - b.id;
   });
   return scored.slice(0, limit);
 }
@@ -493,7 +542,7 @@ export function sourceCounts(): { source: string; n: number }[] {
 export function setVerdict(id: number, verdict: Verdict | null, chips: string[], note: string | null): void {
   const ok = new Set(CHIPS.map((c) => c.key));
   reviewDb()
-    .prepare("UPDATE prospects SET verdict=?, chips=?, note=?, reviewed_at=CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, skipped_at=NULL WHERE id=?")
+    .prepare("UPDATE prospects SET verdict=?, chips=?, note=?, reviewed_at=CASE WHEN ? IS NULL THEN NULL ELSE datetime('now') END, skipped_at=NULL, recheck=0 WHERE id=?")
     .run(verdict, JSON.stringify(chips.filter((c) => ok.has(c))), note?.trim() || null, verdict, id);
 }
 
@@ -535,9 +584,9 @@ export function writeImportFile(dir = path.join(process.cwd(), "data", "review")
       phone: p.phone,
       alt_phone: p.alt_phone ?? "",
       phone_is_mobile: !!p.phone_is_mobile,
-      email: p.email ?? "",
-      website: p.presence === "dead" || chips.includes("no-site") ? "" : p.website ?? "",
-      website_status: p.presence === "none" || p.presence === "dead" || chips.includes("no-site") ? "none" : "weak",
+      email: p.email_suspect ? "" : p.email ?? "",
+      website: chips.includes("no-site") ? "" : p.site_status ? p.site_url ?? "" : p.presence === "dead" ? "" : p.website ?? "",
+      website_status: chips.includes("no-site") || (p.site_status ? !p.site_url : p.presence === "none" || p.presence === "dead") ? "none" : "weak",
       street: p.street ?? "",
       postcode: p.postcode ?? "",
       city: p.city ?? "",
@@ -632,9 +681,9 @@ export function applyRanking(): { ranked: number; delta: boolean; requeuedGood: 
   db.transaction(() => {
     for (const p of all) {
       const fixed = reviewedScore(p);
-      // v2 (0–100) ± 15, squeezed back into 1–99 so it never ties with or passes a said-good lead
-      const nudged = p.v2 + (model.ready ? 30 * (model.predict(p) - 0.5) : 0);
-      const rank = fixed ?? Math.max(1, Math.round((nudged + 15) * (98 / 130)) + 1);
+      // corrected v2 (0–100) ± 15 from the learned pattern, kept in 1–99 so a said-good lead (100+) stays on top
+      const nudged = correctedV2(p).v2 + (model.ready ? 30 * (model.predict(p) - 0.5) : 0);
+      const rank = fixed ?? Math.max(1, Math.min(99, Math.round(nudged)));
       setRank.run(rank, p.id);
       leadScore.run(rank, p.phone);
       if (p.verdict === "good") requeuedGood += requeue.run(p.phone).changes;
@@ -642,4 +691,19 @@ export function applyRanking(): { ranked: number; delta: boolean; requeuedGood: 
     }
   })();
   return { ranked: all.length, delta: model.ready, requeuedGood, removedBad, model };
+}
+
+/**
+ * Bad verdicts given while looking at a website that turned out NOT to be theirs ("not trade" on
+ * claes.se = an IT consultant) go back in the queue for a second look, first in line. Wrap-ups from
+ * the dialer (notes starting 📞) stay: those came with a phone call.
+ */
+export function flagWrongSiteVerdicts(): number {
+  return reviewDb()
+    .prepare(
+      `UPDATE prospects SET prev_verdict=verdict, verdict=NULL, reviewed_at=NULL, recheck=1
+       WHERE verdict='bad' AND site_status IN ('mismatch','name-only','other-business')
+         AND (note IS NULL OR note NOT LIKE '📞%')`
+    )
+    .run().changes;
 }

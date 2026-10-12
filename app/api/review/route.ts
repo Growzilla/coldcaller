@@ -5,8 +5,10 @@ import {
   allReviewed,
   applyRanking,
   buildModel,
+  correctedV2,
   counts,
   features,
+  flagWrongSiteVerdicts,
   importCallFeedback,
   lastReviewed,
   queue,
@@ -30,6 +32,9 @@ function card(p: (Prospect & { fit?: number | null }) | undefined) {
     trades: p.trades ? (JSON.parse(p.trades) as string[]) : [],
     chips: p.chips ? (JSON.parse(p.chips) as string[]) : [],
     features: features(p),
+    // re-scored with the verified site (lib/review correctedV2)
+    v2c: correctedV2(p).v2,
+    v2c_reasons: correctedV2(p).reasons,
   };
 }
 
@@ -38,7 +43,7 @@ function state(order: Order, f: Filter) {
   const q = queue(order, f, model, 8);
   return {
     current: card(q[0]),
-    upcoming: q.slice(1).map((p) => ({ id: p.id, company: p.company, city: p.city, v2: p.v2, fit: p.fit })),
+    upcoming: q.slice(1).map((p) => ({ id: p.id, company: p.company, city: p.city, v2: correctedV2(p).v2, fit: p.fit })),
     last: card(lastReviewed()),
     counts: counts(f),
     sources: sourceCounts(),
@@ -72,6 +77,7 @@ export async function POST(req: Request) {
   const b = await req.json().catch(() => ({} as any));
   if (b.action === "rank") {
     const calls = importCallFeedback();
+    flagWrongSiteVerdicts();
     const r = applyRanking();
     return NextResponse.json({
       ...state(b.order === "learned" ? "learned" : "v2", filterFrom(b)),
