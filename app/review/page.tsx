@@ -80,6 +80,13 @@ function titleCase(s: string | null) {
   return (s || "").toLowerCase().replace(/(^|[\s-])\p{L}/gu, (m) => m.toUpperCase());
 }
 
+/** The verdict is about the PROSPECT, not the site: a bad website in the right niche is a good lead. */
+const VERDICT_HINT: Record<string, string> = {
+  good: "right niche, weak site",
+  maybe: "unsure",
+  bad: "wrong niche or site is fine",
+};
+
 const VERDICT_STYLE: Record<string, string> = {
   good: "bg-emerald-600 hover:bg-emerald-500",
   maybe: "bg-amber-600 hover:bg-amber-500",
@@ -343,8 +350,10 @@ export default function ReviewPage() {
               />
               <div className="flex flex-wrap gap-2">
                 {(["good", "maybe", "bad"] as const).map((v, i) => (
-                  <button key={v} disabled={busy} onClick={() => verdict(v)} className={`rounded px-5 py-2 font-medium capitalize text-white disabled:opacity-50 ${VERDICT_STYLE[v]}`}>
-                    <kbd className="mr-1 opacity-70">{i + 1}</kbd>{v}
+                  <button key={v} disabled={busy} onClick={() => verdict(v)} title={VERDICT_HINT[v]} className={`rounded px-5 py-2 font-medium text-white disabled:opacity-50 ${VERDICT_STYLE[v]}`}>
+                    <kbd className="mr-1 opacity-70">{i + 1}</kbd>
+                    <span className="capitalize">{v}</span>
+                    <span className="ml-1.5 text-xs font-normal opacity-80">{VERDICT_HINT[v]}</span>
                   </button>
                 ))}
                 <button disabled={busy} onClick={skip} className="rounded border border-zinc-700 px-4 py-2 text-zinc-300 hover:bg-zinc-900"><kbd className="mr-1 text-zinc-500">S</kbd>skip</button>
