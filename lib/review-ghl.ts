@@ -7,7 +7,7 @@ import { reviewDb, reviewedScore, type Prospect } from "./review";
  * dialer and the importer): tags go through the bulk endpoints (100 contacts per request), and a
  * contact only gets a PUT when its ICP Score / GBP Status actually changes.
  *
- *   review-good|maybe|bad  + rv-<chip> tags
+ *   review:good|maybe|bad  + rv:<chip> tags (lib/lead-tags scheme)
  *   ICP Score  good → 100 + v2 (above every unreviewed lead), bad → 0, maybe → unchanged
  *   GBP Status "present" / "none" when the reviewer checked it
  *   a note when the reviewer wrote one
@@ -18,7 +18,8 @@ import { reviewDb, reviewedScore, type Prospect } from "./review";
 const BASE = "https://services.leadconnectorhq.com";
 const FIELD_ICP_SCORE = "tDMyf4D4VDlN5B2DT0o6";
 const FIELD_GBP_STATUS = "eck4ZIajgXz2ZBFagWG6";
-const VERDICT_TAGS = ["review-good", "review-maybe", "review-bad"];
+// both styles: review-* from before the lib/lead-tags scheme, review:* now
+const VERDICT_TAGS = ["review-good", "review-maybe", "review-bad", "review:good", "review:maybe", "review:bad"];
 const MAP_MAX_AGE_H = 6;
 
 export class QuotaExhausted extends Error {}
@@ -178,7 +179,7 @@ export async function syncToGhl(): Promise<SyncResult> {
     }
     const groups = new Map<string, string[]>();
     for (const p of ready) {
-      const tags = [`review-${p.verdict}`, ...(p.chips ? (JSON.parse(p.chips) as string[]) : []).map((c) => `rv-${c}`)].sort();
+      const tags = [`review:${p.verdict}`, ...(p.chips ? (JSON.parse(p.chips) as string[]) : []).map((c) => `rv:${c}`)].sort();
       const k = tags.join("|");
       groups.set(k, [...(groups.get(k) ?? []), p.ghl_contact_id]);
     }
