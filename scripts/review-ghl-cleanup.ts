@@ -5,7 +5,7 @@
  * Also removes the old-style tags (swedish, niche-*, icp:*, …) from every existing contact — the
  * upload CSV gave them the new lib/lead-tags scheme.
  *
- *   npm run review:cleanup -- ~/dev/ops/leads-engine/crm/ghl_cleanup_<n>.json [--live]
+ *   npm run review:cleanup -- ~/dev/ops/leads-engine/crm/ghl_cleanup_<n>.json [--live] [--tags-only]
  *
  * ≈ 1 request per contact + 1 per 100 for the tag + the phone→contact listing. Stops cleanly on the
  * daily quota; re-running skips contacts already cleaned (tracked in meta 'ghl_cleanup_done').
@@ -21,6 +21,8 @@ const FIELD_WEBSITE_STATUS = "C94ymQXL6ijHp7qZGrBH";
 
 const file = process.argv[2];
 const live = process.argv.includes("--live");
+// the CSV update import already blanked website/email (skip-empty off) — then only the old tags remain
+const tagsOnly = process.argv.includes("--tags-only");
 if (!file) throw new Error("usage: review:cleanup <ghl_cleanup.json> [--live]");
 const plan = JSON.parse(fs.readFileSync(file, "utf8")) as { legacy_tags: string[]; contacts: { phone: string; company: string; clear: string[] }[] };
 const items = plan.contacts;
@@ -47,7 +49,7 @@ const items = plan.contacts;
       const id = (idOf.get(x.phone) as { contact_id: string } | undefined)?.contact_id;
       if (!id) { missing++; continue; }
       ids.push(id);
-      if (!x.clear.length) { done.add(x.phone); continue; } // tags only — handled in bulk below
+      if (!x.clear.length || tagsOnly) { done.add(x.phone); continue; } // tags only — handled in bulk below
       const body: Record<string, unknown> = {};
       if (x.clear.includes("website")) {
         body.website = null;
