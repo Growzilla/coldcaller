@@ -4,23 +4,13 @@ import { tokenGenerate } from "@vonage/jwt";
 import { config, privateKey, callerIdForCountry } from "./config";
 import { getDb, activeSession, activeCall, type Lead, type SessionRow } from "./db";
 import { publish } from "./bus";
+import { getCallerIdOverride, getOperatorPhone } from "./provider";
 
 declare global {
   // eslint-disable-next-line no-var
   var __vonageClient: Vonage | undefined;
   // eslint-disable-next-line no-var
   var __dialerPoller: ReturnType<typeof setInterval> | undefined;
-  // Manual caller-ID override set via the header toggle; null/undefined = auto-by-country.
-  // eslint-disable-next-line no-var
-  var __callerIdOverride: "US" | "SE" | null | undefined;
-}
-
-/** The effective caller-ID region toggle: explicit override, or null for auto-by-country. */
-export function getCallerIdOverride(): "US" | "SE" | null {
-  return globalThis.__callerIdOverride ?? null;
-}
-export function setCallerIdOverride(region: "US" | "SE" | null): void {
-  globalThis.__callerIdOverride = region;
 }
 
 /** Vonage Voice API wants digits-only E.164 (no leading +). */
@@ -95,7 +85,7 @@ export async function startSession(mode: "phone" | "rtc" = "phone"): Promise<Ses
 
   try {
     const resp = await getVonage().voice.createOutboundCall({
-      to: [{ type: "phone", number: digits(config.operatorPhone) }],
+      to: [{ type: "phone", number: digits(getOperatorPhone()) }],
       from: { type: "phone", number: digits(config.vonageNumber) },
       ringingTimer: 40,
       ncco: [

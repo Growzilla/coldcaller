@@ -1,6 +1,7 @@
 import { getDb } from "./db";
 import { config } from "./config";
 import { publish } from "./bus";
+import { markBooked } from "./ghl";
 
 /**
  * Booked-meeting detection. Dormant until CALENDLY_TOKEN is set
@@ -45,6 +46,7 @@ export async function checkBookings(): Promise<void> {
           lead.id
         );
         publish({ type: "booked", payload: { lead_id: lead.id, company: lead.company, start: ev.start_time } });
+        void markBooked(lead.id, ev.start_time); // GHL → Meeting Booked
       }
       db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)").run(evKey, String(ev.start_time));
     }

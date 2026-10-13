@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { hangupActiveCall } from "@/lib/vonage";
+import { hangupActiveCall } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 

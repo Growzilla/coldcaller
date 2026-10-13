@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { sendDtmf } from "@/lib/vonage";
+import { sendDtmf } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 

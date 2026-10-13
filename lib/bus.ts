@@ -1,7 +1,7 @@
 /** Tiny in-process pub/sub feeding the SSE stream. Singleton across Next dev reloads. */
 
 export type DialerEvent = {
-  type: "session" | "call" | "queue" | "ping" | "intel" | "booked" | "inbound";
+  type: "session" | "call" | "queue" | "ping" | "intel" | "booked" | "inbound" | "sms" | "verify";
   payload: any;
 };
 

@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# coldcall — one-command CLEAN boot for the RapidDial cockpit.
+#
+# "Clean" is the whole point: the 2026-06-12 dead-air bug was a zombie session that
+# looked live but had no audio. This script guarantees a fresh state every time —
+# server up, tunnel up + webhooks registered, and ANY stale line reaped — so when you
+# hit "Start line" you get verified audio, never a corpse.
+#
+# Install: symlinked to ~/.local/bin/coldcall (on PATH). Run `coldcall` from anywhere.
+set -uo pipefail
+
+APP="/home/god0fm0ney/dev/projects/coldcaller"
+URL="http://localhost:3100"
+# Telephony backend for this session. 46elks is the live one (Vonage creds 401 since 2026-10-07);
+# `COLDCALL_PROVIDER=vonage coldcall` switches back.
+PROVIDER="${COLDCALL_PROVIDER:-46elks}"
+DEV_LOG="/tmp/coldcaller-dev.log"
+TUN_LOG="/tmp/coldcaller-tunnel.log"
+
+cd "$APP" 2>/dev/null || { echo "✗ coldcaller dir missing: $APP"; exit 1; }
+say() { printf '%s\n' "$*"; }
+hr()  { printf '──────────────────────────────────────────\n'; }
+http() { curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
+
+say "🦖 RapidDial — clean boot"; hr
+
+# 1) Server ----------------------------------------------------------------
+if [ "$(http "$URL")" = "200" ]; then
+  say "✓ server already up"
+else
+  say "… starting server (npm run dev)"
+  (npm run dev >"$DEV_LOG" 2>&1 &)
+  for _ in $(seq 1 30); do sleep 1; [ "$(http "$URL")" = "200" ] && break; done
+  if [ "$(http "$URL")" = "200" ]; then say "✓ server up"; else
+    say "✗ server failed to start — tail $DEV_LOG"; exit 1; fi
+fi
+
+# 1b) Provider — set before the tunnel so webhook registration + balance read the right backend.
+curl -s -X POST "$URL/api/provider" -H 'Content-Type: application/json' -d "{\"provider\":\"$PROVIDER\"}" >/dev/null 2>&1
+say "✓ provider: $PROVIDER"
+
+# 2) Tunnel (browser-line + inbound). Restart ONLY if dead/unregistered ----
+# cloudflared auto-updates itself and silently exits (killed the line 2026-06-11),
+# so a running PID isn't enough — require the webhook-registration line in the log.
+# A live PID + log line still isn't proof: on 2026-10-07 cloudflared stayed running with a dead
+# control stream for hours. Probe the public URL end-to-end — an unsigned webhook hit must 403.
+tunnel_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" 2>/dev/null | tail -1)
+tunnel_live() { [ -n "$tunnel_url" ] && [ "$(http -X POST "$tunnel_url/api/elks/voice")" = "403" ]; }
+if pgrep -x cloudflared >/dev/null 2>&1 && grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && tunnel_live; then
+  say "✓ tunnel up: $(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)"
+else
+  say "… (re)starting tunnel (npm run tunnel)"
+  pkill -x cloudflared 2>/dev/null   # ephemeral quick-tunnel only — safe to recycle
+  [ -f "$TUN_LOG" ] && mv "$TUN_LOG" "$TUN_LOG.old" 2>/dev/null
+  (npm run tunnel >"$TUN_LOG" 2>&1 &)
+  for _ in $(seq 1 25); do sleep 1; grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && break; done
+  if grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null; then
+    say "✓ tunnel up: $(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)"
+  else
+    say "⚠ tunnel not confirmed — browser line + inbound may fail (tail $TUN_LOG)"
+  fi
+fi
+
+# 3) CLEAN STATE: reap any zombie session (the dead-air root cause) ---------
+state=$(curl -s "$URL/api/state" 2>/dev/null)
+if [ -n "$(printf '%s' "$state" | jq -r '.session // empty' 2>/dev/null)" ]; then
+  http -X POST "$URL/api/session/end" >/dev/null
+  say "♻️  reaped a stale line — clean slate"
+  state=$(curl -s "$URL/api/state" 2>/dev/null)   # refresh after reaping
+else
+  say "✓ no stale line"
+fi
+
+# 3b) Morning queue from GHL (GHL is the lead master). Skipped when sync isn't configured.
+pull=$(curl -s -X POST "$URL/api/ghl/pull" 2>/dev/null)
+if [ "$(printf '%s' "$pull" | jq -r '.ok // empty' 2>/dev/null)" = "true" ]; then
+  say "✓ GHL queue pulled: $(printf '%s' "$pull" | jq -r '"\(.inserted) new · \(.requeued) re-queued · \(.fetched) open in GHL · \(.scored // 0) ICP-scored · \(.nixHeld // 0) held (NIX)"')"
+  state=$(curl -s "$URL/api/state" 2>/dev/null)   # refresh counts after the pull
+elif [ -n "$(printf '%s' "$pull" | jq -r '.error // empty' 2>/dev/null)" ]; then
+  say "⚠ GHL pull: $(printf '%s' "$pull" | jq -r '.error')"
+fi
+
+# 4) Balance + queue snapshot ---------------------------------------------
+hr
+bal=$(printf '%s' "$state" | jq -r '.balance // empty' 2>/dev/null)
+cur=$(printf '%s' "$state" | jq -r '.balanceCurrency // "EUR"' 2>/dev/null)
+prov=$(printf '%s' "$state" | jq -r '.provider // "vonage"' 2>/dev/null)
+# Same thresholds the server enforces at line start: €1 on Vonage, 5 SEK on 46elks.
+low=$(printf '%s' "$state" | jq -r 'if .provider == "46elks" then (if (.balance // 99) < 5 then 1 else 0 end) else (if (.balance // 9) < 1 then 1 else 0 end) end' 2>/dev/null)
+queued=$(printf '%s' "$state" | jq -r '.counts.queued // 0' 2>/dev/null)
+today=$(printf '%s' "$state" | jq -r '.counts.callsToday // 0' 2>/dev/null)
+if [ -n "$bal" ]; then
+  if [ "$prov" = "46elks" ]; then
+    printf '💶 46elks balance %.2f %s' "$bal" "$cur"
+    [ "$low" = "1" ] && printf '  ⚠️  TOP UP — calls blocked under 5 SEK (46elks.se → Account)'
+  else
+    printf '💶 balance €%.2f' "$bal"
+    [ "$low" = "1" ] && printf '  ⚠️  TOP UP — calls blocked under €1 (dashboard.vonage.com → Billing)'
+  fi
+  echo
+fi
+say "📞 $queued queued · $today calls today"
+if [ "$PROVIDER" = "46elks" ]; then
+  # Browser line needs a 46elks WebRTC client number (auto-discovered by the server).
+  rtc=$(npm run -s elks:webrtc 2>&1 | head -1)
+  say "🎧 $rtc"
+  case "$rtc" in *"no WebRTC number"*) say "   → top up 46elks, then: npm run elks:webrtc -- --allocate  (or use 📱 phone mode)";; esac
+fi
+
+# 5) Open the cockpit ------------------------------------------------------
+hr
+say "→ opening $URL"
+# source=ghl → dial the GHL queue (ICP-ranked, best first); COLDCALL_SOURCE="" shows every source.
+xdg-open "$URL/?provider=$PROVIDER&source=${COLDCALL_SOURCE-ghl}" >/dev/null 2>&1 &
+say ""
+say "🎧 Start line (browser) → allow mic → wait for the ✅ AUDIO VERIFIED banner → P to dial."
+say "   If you ever see 🔊❌ or LINE DEAD: End line + Start line (it self-verifies again)."

@@ -1,31 +1,21 @@
 import { NextResponse } from "next/server";
 import { activeSession, activeCall, nextLead, queuePreview, queueCounts, countryBreakdown, sourceBreakdown } from "@/lib/db";
-import { config, assertCallReady, callerIdForCountry, callerRegionForCountry } from "@/lib/config";
-import { getCallerIdOverride } from "@/lib/vonage";
+import { callerIdForCountry, callerRegionForCountry, ELKS_CALLER_ID, config } from "@/lib/config";
+import { assertDialerReady, getCallerIdOverride, getDialerProvider, getOperatorPhone, getProviderBalance } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 
 declare global {
   // eslint-disable-next-line no-var
-  var __balanceCache: { value: number | null; at: number } | undefined;
+  var __balanceCache: { value: { amount: number; currency: string } | null; at: number; provider?: string } | undefined;
 }
 
-async function getBalance(): Promise<number | null> {
+async function getBalance() {
+  const provider = getDialerProvider();
   const cache = globalThis.__balanceCache;
-  if (cache && Date.now() - cache.at < 5 * 60 * 1000) return cache.value;
-  let value: number | null = null;
-  try {
-    if (config.vonageApiKey && config.vonageApiSecret) {
-      const res = await fetch(
-        `https://rest.nexmo.com/account/get-balance?api_key=${config.vonageApiKey}&api_secret=${encodeURIComponent(config.vonageApiSecret)}`,
-        { cache: "no-store" }
-      );
-      if (res.ok) value = Number((await res.json()).value);
-    }
-  } catch {
-    /* balance is cosmetic — never block on it */
-  }
-  globalThis.__balanceCache = { value, at: Date.now() };
+  if (cache && cache.provider === provider && Date.now() - cache.at < 5 * 60 * 1000) return cache.value;
+  const value = await getProviderBalance();
+  globalThis.__balanceCache = { value, at: Date.now(), provider };
   return value;
 }
 
@@ -33,19 +23,25 @@ export async function GET(req: Request) {
   const params = new URL(req.url).searchParams;
   const country = params.get("country") || null;
   const source = params.get("source") || null;
-  void import("@/lib/calendly").then((m) => m.checkBookings()); // dormant without CALENDLY_TOKEN
+  void import("@/lib/calendly").then((m) => m.checkBookings());
+  const provider = getDialerProvider();
   const override = getCallerIdOverride();
   const lead = nextLead(country, source) ?? null;
-  // Caller ID that the NEXT dial will actually use: manual override, else auto from
-  // the next lead's country, else the selected country filter.
-  const callerId = callerIdForCountry(lead?.country ?? country, override);
-  const callerRegion = override ?? callerRegionForCountry(lead?.country ?? country);
+  const callerId =
+    provider === "46elks"
+      ? ELKS_CALLER_ID
+      : provider === "twilio"
+        ? config.twilioNumber
+        : callerIdForCountry(lead?.country ?? country, override, "vonage");
+  const callerRegion = provider === "46elks" ? "SE" : override ?? callerRegionForCountry(lead?.country ?? country);
+  const bal = await getBalance();
   return NextResponse.json({
-    ready: assertCallReady(),
+    ready: assertDialerReady(),
+    provider,
     callerId,
     callerRegion,
     callerOverride: override,
-    operatorPhone: config.operatorPhone || null,
+    operatorPhone: getOperatorPhone() || null,
     session: activeSession() ?? null,
     call: activeCall() ?? null,
     currentLead: lead,
@@ -53,6 +49,7 @@ export async function GET(req: Request) {
     counts: queueCounts(country, source),
     countries: countryBreakdown(),
     sources: sourceBreakdown(),
-    balance: await getBalance(),
+    balance: bal?.amount ?? null,
+    balanceCurrency: bal?.currency ?? "EUR",
   });
 }

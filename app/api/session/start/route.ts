@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
-import { startSession } from "@/lib/vonage";
-import { assertCallReady, config } from "@/lib/config";
+import { startSession, assertDialerReady, getDialerProvider, getOperatorPhone } from "@/lib/dialer";
+import { config } from "@/lib/config";
+import { getBalanceSek } from "@/lib/elks";
 
 export const dynamic = "force-dynamic";
 
@@ -11,13 +12,32 @@ export async function POST(req: Request) {
     .json()
     .then((b) => (b?.mode === "rtc" ? "rtc" : "phone") as "rtc" | "phone")
     .catch(() => "phone" as const);
-  const notReady = assertCallReady();
-  // RTC mode doesn't need OPERATOR_PHONE (no PSTN leg to the operator).
+  const provider = getDialerProvider();
+  const notReady = assertDialerReady(mode);
+  // RTC mode doesn't need OPERATOR_PHONE (no PSTN leg to the operator) on Vonage.
   if (notReady && !(mode === "rtc" && notReady.includes("OPERATOR_PHONE")))
     return NextResponse.json({ error: notReady }, { status: 400 });
-  // Hard gate (phone mode only — the RTC line itself is free): a session with <€1 dies
-  // mid-call with a cryptic instant "failed" — block early instead.
-  if (mode === "phone") try {
+  // Hard gate: block when balance too low to complete a call.
+  if (provider === "46elks") {
+    if (mode === "phone") {
+      const op = getOperatorPhone();
+      if (!op.startsWith("+46")) {
+        return NextResponse.json(
+          { error: "46elks phone mode needs your Swedish mobile (+46…) — or use 🎧 browser line" },
+          { status: 400 }
+        );
+      }
+    }
+    const sek = await getBalanceSek();
+    if (sek !== null && sek < 5)
+      return NextResponse.json(
+        { error: `46elks balance ${sek.toFixed(2)} SEK — top up at 46elks.se before calling` },
+        { status: 400 }
+      );
+  } else if (provider === "twilio") {
+    if (mode === "phone" && !getOperatorPhone())
+      return NextResponse.json({ error: "Set your mobile number first — or use 🎧 browser line" }, { status: 400 });
+  } else if (mode === "phone") try {
     const res = await fetch(
       `https://rest.nexmo.com/account/get-balance?api_key=${config.vonageApiKey}&api_secret=${encodeURIComponent(config.vonageApiSecret)}`,
       { cache: "no-store" }

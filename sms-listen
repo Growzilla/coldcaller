@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# sms-listen — self-hosted 46elks OTP capture (missed-call CLI / voice / SMS).
+#
+# No Render deploy needed. Starts local dev + cloudflare tunnel, points sms_url
+# at the tunnel, opens the cockpit SMS inbox. Ctrl+C stops the tunnel; re-run when
+# you need to confirm via text again.
+#
+# Usage:
+#   ./sms-listen              # default: missed-call mode (Meta "Missed call")
+#   ./sms-listen missed       # same
+#   ./sms-listen listen       # voice OTP (answer + record spoken code)
+#   ./sms-listen off
+#
+# Install: ln -sf "$(pwd)/sms-listen" ~/.local/bin/sms-listen
+set -uo pipefail
+
+APP="/home/god0fm0ney/dev/projects/coldcaller"
+URL="http://localhost:3100"
+MODE="${1:-missed}"
+case "$MODE" in
+  missed|listen|forward|off) ;;
+  voice) MODE=listen ;;
+  *) echo "Usage: $0 [missed|listen|forward|off]"; exit 1 ;;
+esac
+COCKPIT="${URL}?sms=1&verify=${MODE}"
+DEV_LOG="/tmp/coldcaller-dev.log"
+TUN_LOG="/tmp/coldcaller-sms-tunnel.log"
+NUMBER="+46766861525"
+
+cd "$APP" 2>/dev/null || { echo "✗ coldcaller dir missing: $APP"; exit 1; }
+say() { printf '%s\n' "$*"; }
+hr()  { printf '──────────────────────────────────────────\n'; }
+http() { curl -s -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
+
+say "📞 OTP capture — mode=${MODE} on +46766861525"; hr
+
+# 1) Server ----------------------------------------------------------------
+if [ "$(http "$URL")" = "200" ]; then
+  say "✓ server already up"
+else
+  say "… starting server (npm run dev)"
+  (npm run dev >"$DEV_LOG" 2>&1 &)
+  for _ in $(seq 1 30); do sleep 1; [ "$(http "$URL")" = "200" ] && break; done
+  if [ "$(http "$URL")" = "200" ]; then say "✓ server up"; else
+    say "✗ server failed to start — tail $DEV_LOG"; exit 1; fi
+fi
+
+# 2) Tunnel — restart if dead or sms_url still points elsewhere (e.g. Render)
+tun_url=""
+configured_sms=""
+if [ "$(http "$URL/api/elks/sms/inbox")" = "200" ]; then
+  configured_sms=$(curl -s "$URL/api/elks/sms/inbox" | jq -r '.smsUrl // empty' 2>/dev/null)
+fi
+
+need_tunnel=1
+if pgrep -f cloudflared >/dev/null 2>&1 && grep -q "46elks voice_start" "$TUN_LOG" 2>/dev/null; then
+  tun_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)
+  configured_voice=$(curl -s "$URL/api/elks/verify/inbox" | jq -r '.voiceUrl // empty' 2>/dev/null)
+  if [ -n "$tun_url" ] && [ -n "$configured_voice" ] && printf '%s' "$configured_voice" | grep -qF "$tun_url"; then
+    need_tunnel=0
+    say "✓ tunnel up: $tun_url"
+    say "✓ voice_start → $configured_voice"
+    [ -n "$configured_sms" ] && say "✓ sms_url → $configured_sms"
+  fi
+fi
+
+if [ "$need_tunnel" = "1" ]; then
+  if [ -n "$configured_sms" ] && printf '%s' "$configured_sms" | grep -qv 'trycloudflare\.com'; then
+    say "… repointing sms_url away from $(printf '%s' "$configured_sms" | sed 's|/api/elks/sms||')"
+  fi
+  say "… (re)starting tunnel (npm run tunnel)"
+  pkill -f cloudflared 2>/dev/null
+  [ -f "$TUN_LOG" ] && mv "$TUN_LOG" "$TUN_LOG.old" 2>/dev/null
+  (npm run tunnel >"$TUN_LOG" 2>&1 &)
+  for _ in $(seq 1 30); do
+    sleep 1
+    grep -q "46elks voice_start" "$TUN_LOG" 2>/dev/null && break
+  done
+  if grep -q "46elks voice_start" "$TUN_LOG" 2>/dev/null; then
+    tun_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)
+    say "✓ tunnel up: $tun_url"
+    say "✓ voice_start → ${tun_url}/api/elks/voice"
+    say "✓ sms_url → ${tun_url}/api/elks/sms"
+  else
+    say "✗ tunnel failed — tail $TUN_LOG"; exit 1
+  fi
+fi
+
+# 3) Provider + verify mode for Meta OTP ---------------------------------
+curl -s -X POST "$URL/api/provider" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"46elks"}' >/dev/null 2>&1 || true
+
+verify=$(curl -s -X POST "$URL/api/elks/verify-mode" \
+  -H "Content-Type: application/json" \
+  -d "{\"mode\":\"$MODE\"}")
+verify_mode=$(printf '%s' "$verify" | jq -r '.mode // empty' 2>/dev/null)
+if [ "$verify_mode" = "$MODE" ]; then
+  case "$MODE" in
+    missed) say "✓ verify MISSED — will NOT answer; CLI last digits = OTP" ;;
+    listen) say "✓ verify LISTEN — answers + records spoken OTP" ;;
+    forward) say "✓ verify FORWARD — bridges to operator mobile" ;;
+    off) say "✓ verify OFF" ;;
+  esac
+else
+  say "⚠ verify mode failed — $(printf '%s' "$verify" | jq -r '.error // .mode // empty' 2>/dev/null)"
+fi
+
+# Missed-call smoke: webhook must reject (not answer/record)
+if [ "$MODE" = "missed" ]; then
+  body=$(curl -s -X POST "$URL/api/elks/voice" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data "from=441616961154&to=46766861525&callid=missed-smoke-$(date +%s)")
+  if printf '%s' "$body" | grep -q 'hangup'; then
+    say "✓ missed smoke: voice webhook rejects (hangup) — will not answer Meta"
+  else
+    say "✗ missed smoke FAIL — expected hangup/reject, got: $body"
+  fi
+  inbox=$(curl -s "$URL/api/elks/verify/inbox")
+  if printf '%s' "$inbox" | grep -q 'Missed-call CLI'; then
+    say "✓ missed smoke: CLI OTP stored in inbox"
+  else
+    say "⚠ missed smoke: inbox missing CLI row — check /api/elks/verify/inbox"
+  fi
+fi
+
+say "… SMS smoke test"
+if npm run -s elks-sms-test 2>&1 | tee /tmp/coldcaller-sms-smoke.log | grep -q "0 failed"; then
+  say "✓ SMS smoke test passed"
+else
+  say "⚠ SMS smoke test had failures — check /tmp/coldcaller-sms-smoke.log"
+fi
+
+# 4) Handoff ---------------------------------------------------------------
+hr
+say "📱 number: $NUMBER"
+say "🌐 voice:  ${tun_url}/api/elks/voice"
+say "🌐 sms:    ${tun_url}/api/elks/sms"
+say "⚙  mode:   $MODE"
+say ""
+if [ "$MODE" = "missed" ]; then
+  say "While this is running (MISSED CALL):"
+  say "  1. In Meta/WhatsApp enter $NUMBER"
+  say "  2. Choose MISSED CALL (not Voice, not SMS)"
+  say "  3. Meta rings briefly — we REJECT (do not answer)"
+  say "  4. OTP = last digits of Meta's caller ID (shown in cockpit)"
+  say "  5. Try last 6, then 5, then 4 if form rejects"
+else
+  say "While this is running (VOICE):"
+  say "  1. In Meta/WhatsApp enter $NUMBER"
+  say "  2. Choose VOICE CALL"
+  say "  3. We answer + record spoken code → cockpit Voice OTP"
+fi
+say "  Keep this terminal open (tunnel dies if you stop it)"
+say ""
+say "→ opening $COCKPIT"
+xdg-open "$COCKPIT" >/dev/null 2>&1 &
+say ""
+say "Stop: pkill -f cloudflared   (re-run sms-listen next time you need OTP)"

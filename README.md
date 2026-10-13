@@ -76,3 +76,31 @@ No call recording (keeps GDPR surface minimal).
 
 Two concurrent legs ≈ €0.04–0.08/min total to Swedish mobiles. Balance shows in the header;
 calls are blocked under €1.
+
+## GoHighLevel sync (`lib/ghl.ts`)
+
+GHL is the lead master. `coldcall` pulls your open opportunities in **New Lead / Attempted /
+Callback** into the queue (callbacks first; anything dialed < 20 h ago stays out). Every wrapup
+pushes back: contact upsert, stage move (never backward), `cc-*` tag, call note, and the AI
+summary as a follow-up note. Calendly bookings → **Meeting Booked**. Sync is off until the token
+is set, and a GHL outage never blocks dialing (failures → `calls.ghl_error`, retry with `resync`).
+
+| Wrapup | GHL |
+|---|---|
+| 1 no answer | → Attempted |
+| 2 callback | → Callback |
+| 3 interested | → Interested |
+| 4 not interested | status Lost |
+| 5 bad number | status Lost |
+| Calendly booking | → Meeting Booked |
+
+One-time setup:
+1. GHL → Opportunities → Pipelines: create **Outbound** with stages named exactly
+   `New Lead`, `Attempted`, `Callback`, `Interested`, `Meeting Booked` (add later stages freely).
+2. GHL sub-account → Settings → Private Integrations → new token, scopes: contacts (read/write),
+   opportunities (read/write), locations (read).
+3. `.env.local`: `GHL_PRIVATE_TOKEN=…`, `GHL_LOCATION_ID=…`, `GHL_USER_ID=…` (your GHL user —
+   each cofounder's dialer sets their own), optional `GHL_PIPELINE_NAME` (default `Outbound`).
+4. `npm run ghl -- check` → then migrate the local list once: `npm run ghl -- push --limit 1000`.
+
+Commands: `npm run ghl -- check | pull | push [--limit N] [--source FILE] | resync`.

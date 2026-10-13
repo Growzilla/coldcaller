@@ -2,6 +2,7 @@ import fs from "fs";
 import { getDb } from "./db";
 import { config } from "./config";
 import { publish } from "./bus";
+import { syncIntel } from "./ghl";
 
 export type Analysis = {
   summary: string;
@@ -28,6 +29,7 @@ export async function processCall(callId: number): Promise<void> {
     const analysis = await analyze(transcript);
     db.prepare("UPDATE calls SET analysis=? WHERE id=?").run(JSON.stringify(analysis), callId);
     publish({ type: "intel", payload: { call_id: callId, analysis } });
+    void syncIntel(callId); // AI summary → GHL note, if the wrapup already went out without it
   } catch (err: any) {
     db.prepare("UPDATE calls SET analysis=? WHERE id=?").run(
       JSON.stringify({ error: String(err?.message || err) }),

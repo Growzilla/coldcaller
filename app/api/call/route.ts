@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { dialLead } from "@/lib/vonage";
+import { dialLead } from "@/lib/dialer";
 import { getDb, type Lead } from "@/lib/db";
 import { toE164 } from "@/lib/phone";
 
