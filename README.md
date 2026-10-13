@@ -1,7 +1,36 @@
 # RapidDial — Growzilla cold-calling cockpit
 
-Single-operator power dialer. You answer one call at session start and stay on the line;
-every lead is then bridged into your live call. Talk on your own phone — no headset, no WebRTC.
+Single-operator power dialer: a keyboard-driven cockpit that dials a lead queue one call at a
+time, through your browser (mic + speakers) or your own phone. Providers: **Twilio** (any
+country), **46elks** (Sweden), **Vonage** (legacy). Recording, AI call summaries and GoHighLevel
+sync are optional.
+
+## Quickstart (fork → calling in ~10 minutes)
+
+Needs Node 20+, [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+(free quick tunnel for provider webhooks, no account) and `jq`.
+
+```bash
+git clone git@github.com:<you>/coldcaller.git && cd coldcaller
+npm install
+cp .env.example .env.local      # fill in ONE provider (Twilio is the easiest outside Sweden)
+./coldcall                      # starts server + tunnel, reaps stale lines, opens http://localhost:3100
+```
+
+**Twilio setup**: in console.twilio.com copy the Account SID + Auth Token, buy/choose a voice
+number (`TWILIO_NUMBER`), and create an API key (Account → API keys → Standard) for the browser
+line. No TwiML App or webhook config needed. Each dial, Twilio rings your browser, the cockpit
+answers it, and Twilio connects the lead.
+
+Then in the cockpit: import leads (header button, any Apollo-style CSV, or `npm run import -- file.csv`)
+→ **🎧 Start line (browser)** → allow the mic → wait for **✅ AUDIO VERIFIED** → press **P** to call,
+**H** to hang up, **1–5** for the outcome, **Enter** for next. Only one call can be live at a time.
+
+Optional: symlink `ln -s "$PWD/coldcall" ~/.local/bin/coldcall` to boot from anywhere. Set
+`DIALER_PASSWORD` before exposing the app beyond localhost.
+
+> The sections below describe the original Vonage phone-bridge setup and the 46elks/GHL
+> workflow; `CLAUDE.md` holds the detailed operational notes.
 
 ## Architecture
 
@@ -39,7 +68,7 @@ In the cockpit: **Start line** → answer your phone once → you're live for th
 
 | Key | Action |
 |-----|--------|
-| `C` | Call current lead |
+| `P` | Call current lead (one call at a time) |
 | `H` | Hang up lead (you stay on the line) |
 | `1–5` | Outcome: no answer / callback / interested / not interested / bad number |
 | `Enter` | Save outcome + next lead |

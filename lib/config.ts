@@ -3,7 +3,8 @@ import path from "path";
 import os from "os";
 
 // Fallback: pull Vonage creds from the workspace-level .env if not set locally.
-const WORKSPACE_ENV = "/home/god0fm0ney/dev/.env";
+// Optional and machine-specific; a missing file is ignored. Override with RAPIDDIAL_SHARED_ENV.
+const WORKSPACE_ENV = process.env.RAPIDDIAL_SHARED_ENV || "/home/god0fm0ney/dev/.env";
 
 function parseEnvFile(file: string): Record<string, string> {
   try {

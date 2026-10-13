@@ -9,11 +9,14 @@
 # Install: symlinked to ~/.local/bin/coldcall (on PATH). Run `coldcall` from anywhere.
 set -uo pipefail
 
-APP="/home/god0fm0ney/dev/projects/coldcaller"
+# Repo dir = wherever this script really lives (works through the ~/.local/bin symlink and in any clone).
+APP="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 URL="http://localhost:3100"
 # Telephony backend for this session. 46elks is the live one (Vonage creds 401 since 2026-10-07);
 # `COLDCALL_PROVIDER=vonage coldcall` switches back.
-PROVIDER="${COLDCALL_PROVIDER:-46elks}"
+# Precedence: COLDCALL_PROVIDER > DIALER_PROVIDER in .env.local (forks pick theirs there) > 46elks.
+env_provider=$(grep -E '^DIALER_PROVIDER=' "$APP/.env.local" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')
+PROVIDER="${COLDCALL_PROVIDER:-${env_provider:-46elks}}"
 DEV_LOG="/tmp/coldcaller-dev.log"
 TUN_LOG="/tmp/coldcaller-tunnel.log"
 
@@ -46,15 +49,15 @@ say "✓ provider: $PROVIDER"
 # control stream for hours. Probe the public URL end-to-end — an unsigned webhook hit must 403.
 tunnel_url=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" 2>/dev/null | tail -1)
 tunnel_live() { [ -n "$tunnel_url" ] && [ "$(http -X POST "$tunnel_url/api/elks/voice")" = "403" ]; }
-if pgrep -x cloudflared >/dev/null 2>&1 && grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && tunnel_live; then
+if pgrep -x cloudflared >/dev/null 2>&1 && grep -qE "Server webhook base →|Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && tunnel_live; then
   say "✓ tunnel up: $(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)"
 else
   say "… (re)starting tunnel (npm run tunnel)"
   pkill -x cloudflared 2>/dev/null   # ephemeral quick-tunnel only — safe to recycle
   [ -f "$TUN_LOG" ] && mv "$TUN_LOG" "$TUN_LOG.old" 2>/dev/null
   (npm run tunnel >"$TUN_LOG" 2>&1 &)
-  for _ in $(seq 1 25); do sleep 1; grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && break; done
-  if grep -qE "Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null; then
+  for _ in $(seq 1 25); do sleep 1; grep -qE "Server webhook base →|Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null && break; done
+  if grep -qE "Server webhook base →|Vonage app webhooks|46elks voice_start" "$TUN_LOG" 2>/dev/null; then
     say "✓ tunnel up: $(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$TUN_LOG" | tail -1)"
   else
     say "⚠ tunnel not confirmed — browser line + inbound may fail (tail $TUN_LOG)"
