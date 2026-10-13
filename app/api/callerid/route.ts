@@ -10,7 +10,7 @@ export function GET() {
     override: getCallerIdOverride(),
     numbers: CALLER_IDS,
     provider: getDialerProvider(),
-    locked: getDialerProvider() === "46elks",
+    locked: getDialerProvider() !== "vonage",
   });
 }
 
@@ -20,8 +20,8 @@ export function GET() {
  *   { region: null | "auto" } → auto-pick from each lead's country (default)
  */
 export async function POST(req: Request) {
-  if (getDialerProvider() === "46elks") {
-    return NextResponse.json({ error: "Caller ID is fixed to +46766861525 on 46elks" }, { status: 400 });
+  if (getDialerProvider() !== "vonage") {
+    return NextResponse.json({ error: "Caller ID is fixed to the provider's number (46elks/Twilio)" }, { status: 400 });
   }
   const { region } = await req.json().catch(() => ({ region: undefined }));
   if (region === "US" || region === "SE") setCallerIdOverride(region);

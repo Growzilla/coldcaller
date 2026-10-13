@@ -189,3 +189,19 @@ creds 401 since 2026-10-07) and opens the cockpit at `?provider=46elks&source=gh
   ICP Score custom field via `/contacts/search` (`enrichScores`). Queue order: `priority, score DESC, id`.
   `nix-required` (sole traders) → `status='nix_hold'` until NIX-washed (`GHL_INCLUDE_NIX=1` to dial them).
   The GHL client retries 429s — bulk imports share the 100 req/10 s location limit.
+
+## One call at a time + Twilio provider (2026-10-13)
+
+- **Never two calls at once.** `db.openCalls()` counts in-flight dials (row inserted, provider id not back yet,
+  < 90s old) — the old `activeCall()` guard needed the id, so P pressed during a slow `makeCall` placed parallel
+  calls (calls 348–350: same lead 3× in one second). Cockpit also locks P (`dialingRef`) and shows Hang up while
+  dialing; the browser rejects a second auto-answer leg (486) and the leg of a dial hung up mid-flight.
+- **Hang up ends everything**: every open row's leg (server) + every browser SIP session / Twilio Call. Hang up
+  during an in-flight dial closes the row; `dialLead` sees it on return and kills the new leg.
+- **Twilio** (`DIALER_PROVIDER=twilio` / provider dropdown / `COLDCALL_PROVIDER=twilio coldcall`): same bridge model
+  as 46elks — parent call rings `client:<TWILIO_CLIENT_IDENTITY>` (browser Device, auto-answered) or the operator
+  mobile (phone mode), inline TwiML `<Dial>`s the lead as the child leg. `lib/twilio.ts` (REST, hand-rolled HS256
+  access token with incoming-only grant — no TwiML App needed, X-Twilio-Signature check), `lib/twilio-dialer.ts`,
+  `/api/twilio/token`, `/api/twilio/status` (signed, public via middleware). Env in `.env.local`:
+  `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER`, and for the browser line
+  `TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET`. Not yet: inbound calls to the Twilio number, DTMF to the lead.

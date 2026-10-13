@@ -30,7 +30,9 @@ export async function GET(req: Request) {
   const callerId =
     provider === "46elks"
       ? ELKS_CALLER_ID
-      : callerIdForCountry(lead?.country ?? country, override, "vonage");
+      : provider === "twilio"
+        ? config.twilioNumber
+        : callerIdForCountry(lead?.country ?? country, override, "vonage");
   const callerRegion = provider === "46elks" ? "SE" : override ?? callerRegionForCountry(lead?.country ?? country);
   const bal = await getBalance();
   return NextResponse.json({

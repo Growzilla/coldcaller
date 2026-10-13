@@ -1,5 +1,5 @@
 import { callerIdForCountry, config } from "./config";
-import { getDb, activeSession, activeCall, type Lead, type SessionRow } from "./db";
+import { getDb, activeSession, activeCall, openCalls, type Lead, type SessionRow } from "./db";
 import { publish } from "./bus";
 import { getCallerIdOverride, getElksWebhookBase, getOperatorPhone } from "./provider";
 import { makeCall, getCall, hangupCall, signWebhookUrl, type ElksCall, type ElksLeg } from "./elks";
@@ -163,7 +163,7 @@ export async function dialLead(leadId: number): Promise<number> {
   if (!session || session.status !== "live") throw new Error("No live session — start the line first");
   // activeCall() only sees rows that already have a 46elks id; makeCall takes seconds, so a second
   // P press in that window used to place a parallel call. Count in-flight dials (no id yet) too.
-  if (openCallRows().length) throw new Error("A call is already in progress — hang up first");
+  if (openCalls().length) throw new Error("A call is already in progress — hang up first");
 
   const lead = db.prepare("SELECT * FROM leads WHERE id=?").get(leadId) as Lead | undefined;
   if (!lead?.phone_e164) throw new Error("Lead not found or has no phone number");
@@ -276,24 +276,10 @@ export async function sendDtmf(_digits: string): Promise<void> {
   throw new Error("46elks: press the keys on your phone's keypad — tones pass straight through the bridge");
 }
 
-/**
- * Unended call rows that still count as "in progress": placed legs (have a 46elks id) plus dials
- * whose makeCall hasn't returned yet (no id, started < 90s ago — older ones are crash leftovers).
- */
-function openCallRows(): { id: number; vonage_uuid: string | null }[] {
-  return getDb()
-    .prepare(
-      `SELECT id, vonage_uuid FROM calls WHERE ended_at IS NULL
-         AND (vonage_uuid IS NOT NULL OR started_at > datetime('now', '-90 seconds'))
-       ORDER BY id DESC`
-    )
-    .all() as { id: number; vonage_uuid: string | null }[];
-}
-
 export async function hangupActiveCall(): Promise<void> {
   const db = getDb();
   // Hang up EVERY open leg, not just the newest — a duplicate dial must never be left ringing.
-  const calls = openCallRows();
+  const calls = openCalls();
   if (!calls.length) return;
   for (const call of calls) {
     if (call.vonage_uuid) {

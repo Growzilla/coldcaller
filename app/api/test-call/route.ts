@@ -14,7 +14,7 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     // 46elks bridge rings the operator mobile FIRST, so "bridging" to the operator's own number
     // just comes back busy. Instead ring the mobile and play a clip: answer → hear it = voice path OK.
-    if (getDialerProvider() === "46elks" && !body?.number) {
+    if (getDialerProvider() !== "vonage" && !body?.number) {
       const res = await runLineCheck();
       return NextResponse.json(
         res.ok ? { ok: true, to: getOperatorPhone(), detail: res.detail } : { error: res.detail },

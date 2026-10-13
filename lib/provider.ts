@@ -2,7 +2,7 @@ import { config } from "./config";
 import { getDb } from "./db";
 import { toE164 } from "./phone";
 
-export type DialerProvider = "vonage" | "46elks";
+export type DialerProvider = "vonage" | "46elks" | "twilio";
 /** off | listen (answer+record voice OTP) | missed (reject + CLI last digits) | forward (bridge to operator) */
 export type ElksVerifyMode = "off" | "listen" | "missed" | "forward";
 

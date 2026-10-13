@@ -37,7 +37,18 @@ function env(key: string, fallback = ""): string {
 
 export const config = {
   /** Default telephony backend — overridable at runtime via POST /api/provider. */
-  dialerProvider: (env("DIALER_PROVIDER", "vonage") === "46elks" ? "46elks" : "vonage") as "vonage" | "46elks",
+  dialerProvider: (["46elks", "twilio"].includes(env("DIALER_PROVIDER", "vonage"))
+    ? env("DIALER_PROVIDER")
+    : "vonage") as "vonage" | "46elks" | "twilio",
+  /* Twilio — REST + webhook signatures use SID/token; the browser line needs an API key pair. */
+  twilioAccountSid: env("TWILIO_ACCOUNT_SID"),
+  twilioAuthToken: env("TWILIO_AUTH_TOKEN"),
+  twilioApiKeySid: env("TWILIO_API_KEY_SID"),
+  twilioApiKeySecret: env("TWILIO_API_KEY_SECRET"),
+  /** Twilio-owned number (E.164) — caller ID on every lead leg. */
+  twilioNumber: env("TWILIO_NUMBER"),
+  /** Browser Device identity — Twilio rings `client:<identity>` for each dial. */
+  twilioClientIdentity: env("TWILIO_CLIENT_IDENTITY", "rapiddial-operator"),
   elksApiUsername: env("46ELKS_API_USERNAME"),
   elksApiPassword: env("46ELKS_API_PASSWORD"),
   elksNumber: env("46ELKS_NUMBER", "+46766861525"),
@@ -112,9 +123,10 @@ export function callerRegionForCountry(country?: string | null): "US" | "SE" {
 export function callerIdForCountry(
   country?: string | null,
   override?: "US" | "SE" | null,
-  provider: "vonage" | "46elks" = "vonage"
+  provider: "vonage" | "46elks" | "twilio" = "vonage"
 ): string {
   if (provider === "46elks") return ELKS_CALLER_ID;
+  if (provider === "twilio") return config.twilioNumber;
   if (override) return CALLER_IDS[override];
   return CALLER_IDS[callerRegionForCountry(country)];
 }

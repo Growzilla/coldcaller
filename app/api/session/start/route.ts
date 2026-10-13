@@ -34,6 +34,9 @@ export async function POST(req: Request) {
         { error: `46elks balance ${sek.toFixed(2)} SEK — top up at 46elks.se before calling` },
         { status: 400 }
       );
+  } else if (provider === "twilio") {
+    if (mode === "phone" && !getOperatorPhone())
+      return NextResponse.json({ error: "Set your mobile number first — or use 🎧 browser line" }, { status: 400 });
   } else if (mode === "phone") try {
     const res = await fetch(
       `https://rest.nexmo.com/account/get-balance?api_key=${config.vonageApiKey}&api_secret=${encodeURIComponent(config.vonageApiSecret)}`,

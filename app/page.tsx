@@ -162,7 +162,7 @@ export default function Cockpit() {
   const [callerOverride, setCallerOverride] = useState<"US" | "SE" | null>(null);
   const [balance, setBalance] = useState<number | null>(null);
   const [balanceCurrency, setBalanceCurrency] = useState("EUR");
-  const [provider, setProvider] = useState<"vonage" | "46elks">("vonage");
+  const [provider, setProvider] = useState<"vonage" | "46elks" | "twilio">("vonage");
   const [operatorPhone, setOperatorPhone] = useState("");
   const [operatorPhoneDraft, setOperatorPhoneDraft] = useState("");
   const [session, setSession] = useState<Session>(null);
@@ -193,6 +193,8 @@ export default function Cockpit() {
   const elksRtcRef = useRef<{ ua: any; session: any }>({ ua: null, session: null });
   /** Every live 46elks SIP leg — hang up must kill all of them, not just the newest. */
   const elksSessionsRef = useRef<Set<any>>(new Set());
+  // Twilio browser line — Voice SDK Device + every live Call (each dial is its own incoming call)
+  const twilioRef = useRef<{ device: any; calls: Set<any> }>({ device: null, calls: new Set() });
   /** Hang up pressed before /api/call returned → reject that dial's leg when it reaches the browser. */
   const cancelledDialRef = useRef(false);
   /**
@@ -368,7 +370,7 @@ export default function Cockpit() {
           }).catch(() => {});
           setVerifyMode(verifyQ);
         }
-      } else if (qs.get("provider") === "46elks" || qs.get("provider") === "vonage") {
+      } else if (["46elks", "vonage", "twilio"].includes(qs.get("provider") ?? "")) {
         // `coldcall` opens ?provider=… — the boot script's choice beats a stale saved one.
         const p = qs.get("provider")!;
         await fetch("/api/provider", {
@@ -377,7 +379,7 @@ export default function Cockpit() {
           body: JSON.stringify({ provider: p }),
         });
         localStorage.setItem("dialer-provider", p);
-      } else if (savedProvider === "46elks" || savedProvider === "vonage") {
+      } else if (savedProvider === "46elks" || savedProvider === "vonage" || savedProvider === "twilio") {
         await fetch("/api/provider", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -655,7 +657,7 @@ export default function Cockpit() {
   }, [api, provider, operatorPhoneDraft, operatorPhone, saveOperatorPhone, flash]);
 
   const switchProvider = useCallback(
-    async (next: "vonage" | "46elks") => {
+    async (next: "vonage" | "46elks" | "twilio") => {
       if (session) {
         flash("End the line before switching provider");
         return;
@@ -667,7 +669,9 @@ export default function Cockpit() {
       });
       localStorage.setItem("dialer-provider", next);
       await refresh();
-      flash(next === "46elks" ? "🇸🇪 46elks — calls from +46766861525" : "Vonage provider active");
+      flash(
+        next === "46elks" ? "🇸🇪 46elks — calls from +46766861525" : next === "twilio" ? "Twilio provider active" : "Vonage provider active"
+      );
     },
     [session, flash, refresh]
   );
@@ -831,10 +835,13 @@ export default function Cockpit() {
       // media liveness — the dot must not lie. 46elks: every call is its own pc that closes on hangup,
       // so the LINE is the SIP registration; only a failing pc during a live leg means dead media.
       const elks = elksRtcRef.current;
+      const tw = twilioRef.current;
       setConnDead(
         elks.ua
           ? !elks.ua.isRegistered() || (!!elks.session && cs === "failed")
-          : cs === "failed" || cs === "closed"
+          : tw.device // Twilio: same per-call pc model — the line is the Device registration
+            ? tw.device.state !== "registered" || (tw.calls.size > 0 && cs === "failed")
+            : cs === "failed" || cs === "closed"
       );
       setRtcDiag(
         els.length
@@ -1056,6 +1063,64 @@ export default function Cockpit() {
     }
   }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash]);
 
+  /** Twilio browser line — Voice SDK Device; each dial rings `client:<identity>`, auto-answered here. */
+  const startLineTwilioRtc = useCallback(async () => {
+    setError(null);
+    startInFlightRef.current = true;
+    ensureRemoteAudioPlayback(); // patch RTCPeerConnection BEFORE the SDK builds one
+    await startMicMeter();
+    try {
+      const t = await fetch("/api/twilio/token").then((r) => r.json());
+      if (t.error || !t.token) throw new Error(t.error || "Could not get Twilio token");
+      const { Device } = await import("@twilio/voice-sdk");
+      const device = new Device(t.token, { codecPreferences: ["opus", "pcmu"] as any, closeProtection: true });
+      const calls = twilioRef.current.calls;
+      device.on("incoming", (c: any) => {
+        // Every leg is ours (server-originated). One call at a time: reject a duplicate, and the leg
+        // of a dial already hung up on; anything not expected is stale → reject too.
+        if (calls.size > 0 || cancelledDialRef.current || Date.now() >= expectOutboundUntilRef.current) {
+          cancelledDialRef.current = false;
+          try {
+            c.reject();
+          } catch {}
+          return;
+        }
+        expectOutboundUntilRef.current = 0;
+        calls.add(c);
+        const drop = () => calls.delete(c);
+        for (const ev of ["disconnect", "cancel", "reject", "error"]) c.on(ev, drop);
+        c.accept();
+      });
+      device.on("tokenWillExpire", async () => {
+        const n = await fetch("/api/twilio/token").then((r) => r.json()).catch(() => null);
+        if (n?.token) device.updateToken(n.token);
+      });
+      device.on("error", (e: any) => setError(`Twilio: ${e?.message || e}`));
+      await device.register();
+      twilioRef.current.device = device;
+      try {
+        await api("/api/session/start", { mode: "rtc" });
+      } catch (e: any) {
+        if (!/already active/i.test(String(e?.message))) throw e;
+        await fetch("/api/session/end", { method: "POST" });
+        await api("/api/session/start", { mode: "rtc" });
+      }
+      setConnDead(false);
+      pollRemoteAudio();
+      flash(`Twilio browser line live — calling from ${t.number}`);
+    } catch (e: any) {
+      setError(e?.message || "Twilio browser line failed");
+      stopDiag();
+      try {
+        twilioRef.current.device?.destroy();
+      } catch {}
+      twilioRef.current = { device: null, calls: new Set() };
+      fetch("/api/session/end", { method: "POST" }).catch(() => {});
+    } finally {
+      startInFlightRef.current = false;
+    }
+  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash]);
+
   const startBrowserLine = useCallback(async () => {
     if (session) await fetch("/api/session/end", { method: "POST" });
     // Server is authoritative: a click before the boot's provider switch lands would otherwise
@@ -1068,8 +1133,12 @@ export default function Cockpit() {
       await startLineElksRtc();
       return;
     }
+    if (live === "twilio") {
+      await startLineTwilioRtc();
+      return;
+    }
     await startLineRtc();
-  }, [provider, session, startLineRtc, startLineElksRtc]);
+  }, [provider, session, startLineRtc, startLineElksRtc, startLineTwilioRtc]);
 
   const endLine = useCallback(async () => {
     stopDiag();
@@ -1094,6 +1163,13 @@ export default function Cockpit() {
         ua.stop();
       } catch {}
       elksRtcRef.current = { ua: null, session: null };
+    }
+    if (twilioRef.current.device) {
+      try {
+        twilioRef.current.device.disconnectAll();
+        twilioRef.current.device.destroy();
+      } catch {}
+      twilioRef.current = { device: null, calls: new Set() };
     }
     api("/api/session/end").then(refresh).catch(() => {});
   }, [api, refresh, stopDiag]);
@@ -1180,7 +1256,8 @@ export default function Cockpit() {
 
   // Auto-verify audio once per session, right after the line goes live — before any lead is dialed.
   useEffect(() => {
-    if (!sessionLive || session?.mode !== "rtc" || !(rtcRef.current.client || elksRtcRef.current.ua)) return;
+    if (!sessionLive || session?.mode !== "rtc" || !(rtcRef.current.client || elksRtcRef.current.ua || twilioRef.current.device))
+      return;
     if (checkedSessionRef.current === session.id) return;
     checkedSessionRef.current = session.id;
     const t = setTimeout(() => runLineCheck(), 2500); // give the media leg a beat to settle
@@ -1248,6 +1325,12 @@ export default function Cockpit() {
     }
     elksSessionsRef.current.clear();
     elksRtcRef.current.session = null;
+    for (const c of twilioRef.current.calls) {
+      try {
+        c.disconnect();
+      } catch {}
+    }
+    twilioRef.current.calls.clear();
     // A hang up during an in-flight dial still reaches the server, which cancels that leg on return.
     if (dialingRef.current) cancelledDialRef.current = true;
     api("/api/hangup").catch(() => {});
@@ -1480,16 +1563,26 @@ export default function Cockpit() {
                 📱 phone (46elks)
               </button>
             )}
+            {provider === "twilio" && (
+              <button
+                onClick={startLine}
+                title="Rings your mobile first, then bridges each lead"
+                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900"
+              >
+                📱 phone (Twilio)
+              </button>
+            )}
           </>
         )}
         <select
           value={provider}
-          onChange={(e) => switchProvider(e.target.value as "vonage" | "46elks")}
+          onChange={(e) => switchProvider(e.target.value as "vonage" | "46elks" | "twilio")}
           title="Telephony provider"
           className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300 focus:outline-none"
         >
           <option value="vonage">Vonage</option>
           <option value="46elks">46elks 🇸🇪</option>
+          <option value="twilio">Twilio</option>
         </select>
         <select
           value={region}

@@ -8,6 +8,8 @@ import { assertElksReady, getBalanceSek } from "./elks";
 import { assertElksRtcReady } from "./elks-rtc";
 import * as vonage from "./vonage";
 import * as elksDialer from "./elks-dialer";
+import * as twilioDialer from "./twilio-dialer";
+import { assertTwilioReady, getBalance as getTwilioBalance } from "./twilio";
 
 export {
   getDialerProvider,
@@ -24,7 +26,8 @@ export type { DialerProvider } from "./provider";
 export { roomName, markSessionLive } from "./vonage";
 
 function backend() {
-  return getDialerProvider() === "46elks" ? elksDialer : vonage;
+  const p = getDialerProvider();
+  return p === "46elks" ? elksDialer : p === "twilio" ? twilioDialer : vonage;
 }
 
 export async function startSession(mode: "phone" | "rtc" = "phone") {
@@ -52,6 +55,7 @@ export async function sendDtmf(digits: string) {
 }
 
 export function assertDialerReady(mode: "phone" | "rtc" = "phone"): string | null {
+  if (getDialerProvider() === "twilio") return assertTwilioReady(mode);
   if (getDialerProvider() === "46elks") {
     if (mode === "rtc") return assertElksRtcReady() ?? assertElksReady("rtc");
     return assertElksReady("phone");
@@ -60,6 +64,7 @@ export function assertDialerReady(mode: "phone" | "rtc" = "phone"): string | nul
 }
 
 export async function getProviderBalance(): Promise<{ amount: number; currency: string } | null> {
+  if (getDialerProvider() === "twilio") return getTwilioBalance();
   if (getDialerProvider() === "46elks") {
     const sek = await getBalanceSek();
     return sek !== null ? { amount: sek, currency: "SEK" } : null;

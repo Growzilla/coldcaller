@@ -21,6 +21,7 @@ const WEBHOOK_EXACT = new Set([
   "/api/elks/bridge",
   "/api/elks/whenhangup",
   "/api/elks/verify-recording",
+  "/api/twilio/status", // X-Twilio-Signature checked in the route
 ]);
 
 export function middleware(req: NextRequest) {

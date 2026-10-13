@@ -258,6 +258,21 @@ export function activeCall(): (CallRow & { company: string }) | undefined {
     .get() as (CallRow & { company: string }) | undefined;
 }
 
+/**
+ * Unended call rows that still count as "in progress" (one-call-at-a-time guard): placed legs
+ * (have a provider id) plus dials whose create-call request hasn't returned yet (no id, started
+ * < 90s ago — older id-less rows are crash leftovers).
+ */
+export function openCalls(): { id: number; vonage_uuid: string | null }[] {
+  return getDb()
+    .prepare(
+      `SELECT id, vonage_uuid FROM calls WHERE ended_at IS NULL
+         AND (vonage_uuid IS NOT NULL OR started_at > datetime('now', '-90 seconds'))
+       ORDER BY id DESC`
+    )
+    .all() as { id: number; vonage_uuid: string | null }[];
+}
+
 export type InboundSmsRow = {
   id: string;
   from_e164: string | null;
