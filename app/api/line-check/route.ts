@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { runLineCheck } from "@/lib/vonage";
+import { runLineCheck } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 

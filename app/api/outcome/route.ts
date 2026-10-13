@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getDb, nextLead, queuePreview, queueCounts } from "@/lib/db";
+import { syncCall } from "@/lib/ghl";
 
 export const dynamic = "force-dynamic";
 
@@ -29,14 +30,19 @@ export async function POST(req: Request) {
     const latest = db
       .prepare("SELECT id FROM calls WHERE lead_id=? ORDER BY id DESC LIMIT 1")
       .get(leadId) as { id: number } | undefined;
+    let callId: number;
     if (latest) {
       db.prepare("UPDATE calls SET outcome=?, notes=?, ended_at=COALESCE(ended_at, datetime('now')) WHERE id=?")
         .run(outcome, notes, latest.id);
+      callId = latest.id;
     } else {
-      db.prepare("INSERT INTO calls (lead_id, outcome, notes, ended_at) VALUES (?,?,?,datetime('now'))")
-        .run(leadId, outcome, notes);
+      callId = Number(
+        db.prepare("INSERT INTO calls (lead_id, outcome, notes, ended_at) VALUES (?,?,?,datetime('now'))")
+          .run(leadId, outcome, notes).lastInsertRowid
+      );
     }
     db.prepare("UPDATE leads SET status='done' WHERE id=?").run(leadId);
+    void syncCall(callId); // GHL push — fire-and-forget, never blocks the next lead
   }
 
   const country = body.country ? String(body.country) : null;

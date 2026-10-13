@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import os from "os";
 
 // Fallback: pull Vonage creds from the workspace-level .env if not set locally.
 const WORKSPACE_ENV = "/home/god0fm0ney/dev/.env";
@@ -17,6 +18,15 @@ function parseEnvFile(file: string): Record<string, string> {
   }
 }
 
+/** Token stored in its own chmod-600 file (the /ghl skill keeps the Anvil Systems PIT there). */
+function readTokenFile(file: string): string {
+  try {
+    return fs.readFileSync(file, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
+
 const workspace = parseEnvFile(WORKSPACE_ENV);
 // Next.js loads .env.local into process.env by itself, but tsx scripts don't — parse it here too.
 const local = parseEnvFile(path.join(process.cwd(), ".env.local"));
@@ -26,6 +36,18 @@ function env(key: string, fallback = ""): string {
 }
 
 export const config = {
+  /** Default telephony backend — overridable at runtime via POST /api/provider. */
+  dialerProvider: (env("DIALER_PROVIDER", "vonage") === "46elks" ? "46elks" : "vonage") as "vonage" | "46elks",
+  elksApiUsername: env("46ELKS_API_USERNAME"),
+  elksApiPassword: env("46ELKS_API_PASSWORD"),
+  elksNumber: env("46ELKS_NUMBER", "+46766861525"),
+  elksNumberId: env("46ELKS_NUMBER_ID", "n55db66883374c1cb192f4e2dfa1ded0a"),
+  /** JsSIP WebRTC password from 46elks dashboard → Numbers → edit. */
+  elksWebrtcSecret: env("46ELKS_WEBRTC_SECRET"),
+  /** Optional override; defaults to elksNumber digits without '+'. */
+  elksWebrtcUser: env("46ELKS_WEBRTC_USER"),
+  /** Optional override for the 46elks webhook token (default: derived from the API password). */
+  elksWebhookSecret: env("ELKS_WEBHOOK_SECRET"),
   vonageApiKey: env("VONAGE_REAL_KEY") || env("VONAGE_API_KEY"),
   vonageApiSecret: env("VONAGE_API_SECRET"),
   applicationId: env("VONAGE_APPLICATION_ID"),
@@ -51,6 +73,17 @@ export const config = {
   bookingUrl: env("BOOKING_URL", "https://calendly.com/albert-growzilla/growzilla-demo"),
   bookingFrom: env("BOOKING_FROM", "Albert <albert@growzilla.xyz>"),
   calendlyToken: env("CALENDLY_TOKEN"), // optional — enables booked-detection when set
+  /* GoHighLevel — GHL is the lead master; the dialer pulls its queue and writes outcomes back */
+  /** Sub-account Private Integration Token (Settings → Private Integrations). Empty = sync off. */
+  ghlToken: env("GHL_PRIVATE_TOKEN") || readTokenFile(env("GHL_TOKEN_FILE", path.join(os.homedir(), ".config/ghl/anvil_systems_pit"))),
+  /** Default: Anvil Systems sub-account (the location the leads-engine import writes to). */
+  ghlLocationId: env("GHL_LOCATION_ID", "DebmRaelW8ZFd0sGQG4v"),
+  /** Pipeline the dialer works, matched by name (stages too — see lib/ghl.ts STAGES). */
+  ghlPipelineName: env("GHL_PIPELINE_NAME", "Outbound"),
+  /** This operator's GHL user id — queue pull filters on it, new opportunities get assigned to it. */
+  ghlUserId: env("GHL_USER_ID", "LHS2dyB4LUChw6in1ANT"),
+  /** Sole traders (tag nix-required) need a NIX-Telefon wash first — kept out of the queue unless "1". */
+  ghlIncludeNix: env("GHL_INCLUDE_NIX") === "1",
 };
 
 /**
@@ -61,9 +94,12 @@ export const config = {
  * the header toggle (POST /api/callerid).
  */
 export const CALLER_IDS: Record<"US" | "SE", string> = {
-  US: "+12088587571", // US LVN — US & Canadian prospects
-  SE: "+46790952801", // Swedish LVN — Sweden & Nordic prospects
+  US: "+12088587571", // US LVN — US & Canadian prospects (Vonage only)
+  SE: "+46790952801", // Swedish LVN — Vonage default
 };
+
+/** Swedish caller ID when provider=46elks. */
+export const ELKS_CALLER_ID = env("46ELKS_NUMBER", "+46766861525");
 
 /** Map a lead's country to the right caller ID region. */
 export function callerRegionForCountry(country?: string | null): "US" | "SE" {
@@ -73,7 +109,12 @@ export function callerRegionForCountry(country?: string | null): "US" | "SE" {
 }
 
 /** Resolve the caller ID number for a lead's country (honors a manual override). */
-export function callerIdForCountry(country?: string | null, override?: "US" | "SE" | null): string {
+export function callerIdForCountry(
+  country?: string | null,
+  override?: "US" | "SE" | null,
+  provider: "vonage" | "46elks" = "vonage"
+): string {
+  if (provider === "46elks") return ELKS_CALLER_ID;
   if (override) return CALLER_IDS[override];
   return CALLER_IDS[callerRegionForCountry(country)];
 }
@@ -88,7 +129,7 @@ export function assertCallReady(): string | null {
   if (!config.applicationId) return "Missing VONAGE_APPLICATION_ID — run: npm run setup";
   if (!fs.existsSync(config.privateKeyPath))
     return `Missing private key at ${config.privateKeyPath} — run: npm run setup`;
-  if (!config.operatorPhone)
-    return "Missing OPERATOR_PHONE in .env.local (your mobile, E.164 e.g. +467XXXXXXXX)";
+  if (!(globalThis.__operatorPhone || config.operatorPhone))
+    return "Set your mobile number (cockpit header or OPERATOR_PHONE in .env.local)";
   return null;
 }

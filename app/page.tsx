@@ -35,6 +35,22 @@ type InboundCaller = {
 type Session = { id: number; status: string; mode?: string } | null;
 type Call = { id: number; lead_id: number; vonage_status: string | null; ended_at: string | null; answered_at: string | null } | null;
 type Counts = { queued: number; done: number; callsToday: number };
+type SmsRow = {
+  id: string;
+  from_e164: string | null;
+  to_e164: string | null;
+  message: string | null;
+  created_at: string | null;
+  received_at: string;
+};
+type VerifyRow = {
+  id: string;
+  callid: string | null;
+  from_e164: string | null;
+  code: string | null;
+  transcript: string | null;
+  received_at: string;
+};
 
 const OUTCOMES = [
   { key: "1", value: "no_answer", label: "No answer", cls: "border-zinc-700 text-zinc-300" },
@@ -118,9 +134,22 @@ function applyMicConstraint() {
   const orig = md.getUserMedia.bind(md);
   md.getUserMedia = (constraints: MediaStreamConstraints = {}) => {
     const id = w.__micDeviceId;
-    if (id && constraints.audio) {
+    if (constraints.audio) {
       const base = typeof constraints.audio === "object" ? constraints.audio : {};
-      constraints = { ...constraints, audio: { ...base, deviceId: { exact: id } } };
+      // Ask for voice processing EXPLICITLY: `audio: true` leaves AEC to browser defaults, which
+      // Firefox/Waterfox drops for some devices (stereo USB mics like the Blue) → prospect hears
+      // themselves echo off our speakers. Mono also keeps the AEC path engaged.
+      constraints = {
+        ...constraints,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          ...base,
+          ...(id ? { deviceId: { exact: id } } : {}),
+        },
+      };
     }
     return orig(constraints);
   };
@@ -132,6 +161,10 @@ export default function Cockpit() {
   const [callerRegion, setCallerRegion] = useState<"US" | "SE">("SE");
   const [callerOverride, setCallerOverride] = useState<"US" | "SE" | null>(null);
   const [balance, setBalance] = useState<number | null>(null);
+  const [balanceCurrency, setBalanceCurrency] = useState("EUR");
+  const [provider, setProvider] = useState<"vonage" | "46elks">("vonage");
+  const [operatorPhone, setOperatorPhone] = useState("");
+  const [operatorPhoneDraft, setOperatorPhoneDraft] = useState("");
   const [session, setSession] = useState<Session>(null);
   const [call, setCall] = useState<Call>(null);
   const [lead, setLead] = useState<Lead | null>(null);
@@ -156,7 +189,30 @@ export default function Cockpit() {
   sourceRef.current = source;
   // Browser (WebRTC) line — Vonage Client SDK instance + its active call id
   const rtcRef = useRef<{ client: any; callId: string | null }>({ client: null, callId: null });
+  // 46elks browser line — JsSIP user agent
+  const elksRtcRef = useRef<{ ua: any; session: any }>({ ua: null, session: null });
+  /** Every live 46elks SIP leg — hang up must kill all of them, not just the newest. */
+  const elksSessionsRef = useRef<Set<any>>(new Set());
+  /** Hang up pressed before /api/call returned → reject that dial's leg when it reaches the browser. */
+  const cancelledDialRef = useRef(false);
+  /**
+   * 46elks delivers EVERY leg to the browser as an incoming SIP call. Our own legs (lead dials, test
+   * calls, audio checks) are expected → auto-answer; anything else is a real inbound caller → ring.
+   */
+  const expectOutboundUntilRef = useRef(0);
+  const ringSessRef = useRef<any>(null);
+  const ringToneRef = useRef<{ ac: AudioContext; iv: ReturnType<typeof setInterval> } | null>(null);
+  const [ringing, setRinging] = useState<{ from: string } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const [smsInbox, setSmsInbox] = useState<SmsRow[]>([]);
+  const [verifyInbox, setVerifyInbox] = useState<VerifyRow[]>([]);
+  const [verifyRinging, setVerifyRinging] = useState(false);
+  /** off | listen | missed | forward — from /api/elks/verify-mode */
+  const [verifyMode, setVerifyMode] = useState<"off" | "listen" | "missed" | "forward">("off");
+  const [smsOpen, setSmsOpen] = useState(true);
+  const [smsTo, setSmsTo] = useState("");
+  const [smsBody, setSmsBody] = useState("");
+  const [smsSending, setSmsSending] = useState(false);
   const [intel, setIntel] = useState<{ company?: string; analysis: any } | null>(null);
   const [inbound, setInbound] = useState<InboundCaller | null>(null);
   // Solid-state line: verified-audio status, media liveness, reload-orphan handling
@@ -184,12 +240,78 @@ export default function Cockpit() {
     setTimeout(() => setToast(null), 5000);
   }, []);
 
-  const callActive = !!call && !call.ended_at;
+  // P pressed, /api/call not back yet (makeCall takes seconds): already "in a call" for P/H/buttons.
+  const [dialing, setDialing] = useState(false);
+  const callActive = (!!call && !call.ended_at) || dialing;
   const callStatus = call?.vonage_status ?? null;
+  const prevCallStatusRef = useRef<string | null>(null);
   const callActiveRef = useRef(false);
   callActiveRef.current = callActive;
   const inWrapup = !!call && !!call.ended_at && call.lead_id === lead?.id && !busy;
   const sessionLive = session?.status === "live";
+
+  const refreshSmsInbox = useCallback(async () => {
+    const d = await fetch("/api/elks/sms/inbox").then((r) => r.json()).catch(() => null);
+    if (d?.messages) setSmsInbox(d.messages);
+  }, []);
+
+  const sendSmsNow = useCallback(async () => {
+    const to = (smsTo || leadRef.current?.phone_e164 || "").trim();
+    const message = smsBody.trim();
+    if (!to) return flash("Enter a number to text");
+    if (!message) return;
+    setSmsSending(true);
+    try {
+      const d = await fetch("/api/elks/sms/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to, message }),
+      }).then((r) => r.json());
+      if (d.error) throw new Error(d.error);
+      setSmsBody("");
+      flash(`💬 Sent to ${d.to}${d.costSek != null ? ` · ${d.costSek.toFixed(2)} SEK` : ""}`);
+      refreshSmsInbox();
+    } catch (e: any) {
+      flash(`⚠ SMS failed: ${e?.message || e}`);
+    } finally {
+      setSmsSending(false);
+    }
+  }, [smsTo, smsBody, flash, refreshSmsInbox]);
+
+  const refreshVerifyInbox = useCallback(async () => {
+    const d = await fetch("/api/elks/verify/inbox").then((r) => r.json()).catch(() => null);
+    if (d?.verifications) setVerifyInbox(d.verifications);
+    if (d?.mode === "listen" || d?.mode === "missed" || d?.mode === "forward" || d?.mode === "off") {
+      setVerifyMode(d.mode);
+    }
+  }, []);
+
+  const setVerifyModeApi = useCallback(
+    async (mode: "off" | "listen" | "missed" | "forward") => {
+      const d = await fetch("/api/elks/verify-mode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      })
+        .then((r) => r.json())
+        .catch(() => null);
+      if (d?.mode) {
+        setVerifyMode(d.mode);
+        flash(
+          d.mode === "missed"
+            ? "📵 Missed-call mode — will NOT answer; CLI last digits = OTP"
+            : d.mode === "listen"
+              ? "🎙 Voice OTP mode — answers + records spoken code"
+              : d.mode === "forward"
+                ? "📲 Forward mode — bridges to your mobile"
+                : "Verify capture OFF"
+        );
+      } else {
+        flash(d?.error || "Failed to set verify mode");
+      }
+    },
+    [flash]
+  );
 
   const refresh = useCallback(async () => {
     const qs = new URLSearchParams();
@@ -201,6 +323,10 @@ export default function Cockpit() {
     setCallerRegion(s.callerRegion ?? "SE");
     setCallerOverride(s.callerOverride ?? null);
     setBalance(s.balance);
+    setBalanceCurrency(s.balanceCurrency ?? "EUR");
+    setProvider(s.provider ?? "vonage");
+    setOperatorPhone(s.operatorPhone ?? "");
+    setOperatorPhoneDraft(s.operatorPhone ?? "");
     setSession(s.session);
     setCall(s.call);
     setLead(s.currentLead);
@@ -214,11 +340,64 @@ export default function Cockpit() {
     const saved = localStorage.getItem("dialer-region") ?? "";
     regionRef.current = saved;
     setRegion(saved);
+    // `coldcall` opens ?source=ghl so the GHL queue (best ICP first) is what you dial.
+    const qsSource = new URLSearchParams(window.location.search).get("source");
+    if (qsSource !== null) localStorage.setItem("dialer-source", qsSource);
     const savedSource = localStorage.getItem("dialer-source") ?? "";
     sourceRef.current = savedSource;
     setSource(savedSource);
-    refresh();
-  }, [refresh]);
+    const savedProvider = localStorage.getItem("dialer-provider");
+    const savedOperator = localStorage.getItem("dialer-operator-phone");
+    const qs = new URLSearchParams(window.location.search);
+    const smsMode = qs.get("sms") === "1";
+    const verifyQ = qs.get("verify");
+    const boot = async () => {
+      if (smsMode) {
+        await fetch("/api/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: "46elks" }),
+        });
+        localStorage.setItem("dialer-provider", "46elks");
+        setSmsOpen(true);
+        if (verifyQ === "missed" || verifyQ === "listen" || verifyQ === "forward" || verifyQ === "off") {
+          await fetch("/api/elks/verify-mode", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mode: verifyQ }),
+          }).catch(() => {});
+          setVerifyMode(verifyQ);
+        }
+      } else if (qs.get("provider") === "46elks" || qs.get("provider") === "vonage") {
+        // `coldcall` opens ?provider=… — the boot script's choice beats a stale saved one.
+        const p = qs.get("provider")!;
+        await fetch("/api/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: p }),
+        });
+        localStorage.setItem("dialer-provider", p);
+      } else if (savedProvider === "46elks" || savedProvider === "vonage") {
+        await fetch("/api/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: savedProvider }),
+        });
+      }
+      if (savedOperator) {
+        await fetch("/api/operator-phone", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ phone: savedOperator }),
+        }).catch(() => {});
+      }
+      await refresh();
+    };
+    boot().then(() => {
+      refreshSmsInbox();
+      refreshVerifyInbox();
+    });
+  }, [refresh, refreshSmsInbox, refreshVerifyInbox]);
 
   // Audio devices: patch getUserMedia, restore saved mic + speaker, list in/out (refresh on hot-plug)
   useEffect(() => {
@@ -270,6 +449,18 @@ export default function Cockpit() {
     [refresh]
   );
 
+  useEffect(() => {
+    const st = call?.vonage_status ?? null;
+    if (st === "failed" && prevCallStatusRef.current !== "failed" && provider === "46elks") {
+      const op = operatorPhone || operatorPhoneDraft;
+      const hint = op.startsWith("+46")
+        ? "Call failed — check signal / number and try again"
+        : "Call failed — set your Swedish mobile (+46…) in the header first";
+      flash(`⚠ ${hint}`);
+    }
+    prevCallStatusRef.current = st;
+  }, [call?.vonage_status, provider, operatorPhone, operatorPhoneDraft, flash]);
+
   // Live updates from the server-side Vonage poller
   useEffect(() => {
     const es = new EventSource("/api/events/stream");
@@ -288,6 +479,46 @@ export default function Cockpit() {
           setLead(p.lead);
           setOutcome(null);
           setNotes("");
+        }
+      }
+      if (e.type === "sms") {
+        const row = e.payload as SmsRow;
+        setSmsInbox((prev) => [row, ...prev.filter((m) => m.id !== row.id)].slice(0, 30));
+        const outbound = (row.from_e164 || "").replace(/\D/g, "") === "46766861525";
+        if (!outbound) {
+          setSmsOpen(true);
+          flash(`📩 SMS from ${row.from_e164 ?? "unknown"}`);
+        }
+      }
+      if (e.type === "verify") {
+        const p = e.payload as {
+          status?: string;
+          kind?: string;
+          code?: string | null;
+          candidates?: string[];
+          digits?: string;
+          transcript?: string;
+          from?: string | null;
+        };
+        if (p.status === "ringing") {
+          setVerifyRinging(true);
+          setSmsOpen(true);
+          flash("📞 Verification call incoming on +46766861525…");
+        } else {
+          setVerifyRinging(false);
+          setSmsOpen(true);
+          void refreshVerifyInbox();
+          if (p.kind === "missed" || p.status === "missed") {
+            const cands = p.candidates?.length ? p.candidates.join(" / ") : p.code || "";
+            flash(
+              p.code
+                ? `📵 Missed-call OTP: ${p.code}${p.candidates && p.candidates.length > 1 ? ` (also try ${p.candidates.slice(1).join(", ")})` : ""} — click to copy`
+                : `📵 Missed call from ${p.from || "?"} — ${cands || "no CLI digits"}`
+            );
+          } else if (p.code) flash(`🔊 Voice OTP: ${p.code} — click to copy`);
+          else if (p.digits)
+            flash(`🔊 Partial digits: ${p.digits} (${p.digits.length}/6) — check panel / retry`);
+          else flash("🔊 Verification call recorded — check voice OTP panel");
         }
       }
     };
@@ -354,6 +585,7 @@ export default function Cockpit() {
 
   const api = useCallback(async (path: string, body?: any) => {
     setError(null);
+    if (path === "/api/call" || path === "/api/test-call") expectOutboundUntilRef.current = Date.now() + 45_000;
     const res = await fetch(path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -361,6 +593,7 @@ export default function Cockpit() {
     });
     const data = await res.json();
     if (!res.ok) {
+      if (path === "/api/call" || path === "/api/test-call") expectOutboundUntilRef.current = 0; // no leg coming
       setError(data.error || "Request failed");
       throw new Error(data.error);
     }
@@ -379,7 +612,65 @@ export default function Cockpit() {
       .catch(() => {});
   }, [api]);
 
-  const startLine = useCallback(() => api("/api/session/start", { mode: "phone" }).catch(() => {}), [api]);
+  const saveOperatorPhone = useCallback(async () => {
+    const raw = operatorPhoneDraft.trim();
+    if (!raw) return;
+    if (session) {
+      flash("End the line before changing your phone number");
+      return;
+    }
+    const res = await fetch("/api/operator-phone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ phone: raw }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setError(data.error || "Invalid phone number");
+      return;
+    }
+    setError(null);
+    setOperatorPhone(data.phone ?? raw);
+    setOperatorPhoneDraft(data.phone ?? raw);
+    localStorage.setItem("dialer-operator-phone", data.phone ?? raw);
+    flash(`📱 Your phone set to ${data.phone}`);
+    await refresh();
+  }, [operatorPhoneDraft, session, flash, refresh]);
+
+  const startLine = useCallback(async () => {
+    if (provider === "46elks") {
+      const raw = operatorPhoneDraft.trim();
+      if (!raw) {
+        flash("Enter your Swedish mobile (+46… or 07x…) first — or use 🎧 browser line");
+        return;
+      }
+      if (raw !== operatorPhone) await saveOperatorPhone();
+      const phone = operatorPhone || raw;
+      if (!phone.startsWith("+46")) {
+        flash("46elks phone mode needs a Swedish mobile — or use 🎧 browser line");
+        return;
+      }
+    }
+    await api("/api/session/start", { mode: "phone" }).catch(() => {});
+  }, [api, provider, operatorPhoneDraft, operatorPhone, saveOperatorPhone, flash]);
+
+  const switchProvider = useCallback(
+    async (next: "vonage" | "46elks") => {
+      if (session) {
+        flash("End the line before switching provider");
+        return;
+      }
+      await fetch("/api/provider", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: next }),
+      });
+      localStorage.setItem("dialer-provider", next);
+      await refresh();
+      flash(next === "46elks" ? "🇸🇪 46elks — calls from +46766861525" : "Vonage provider active");
+    },
+    [session, flash, refresh]
+  );
 
   /** Stop all WebRTC diagnostics (mic meter + remote-audio poll). */
   const stopDiag = useCallback(() => {
@@ -537,7 +828,14 @@ export default function Cockpit() {
       const pc = w.__rtcPcCount || 0;
       const trk = w.__rtcTrackCount || 0;
       const cs = w.__rtcConnState as string | undefined;
-      setConnDead(cs === "failed" || cs === "closed"); // media liveness — the dot must not lie
+      // media liveness — the dot must not lie. 46elks: every call is its own pc that closes on hangup,
+      // so the LINE is the SIP registration; only a failing pc during a live leg means dead media.
+      const elks = elksRtcRef.current;
+      setConnDead(
+        elks.ua
+          ? !elks.ua.isRegistered() || (!!elks.session && cs === "failed")
+          : cs === "failed" || cs === "closed"
+      );
       setRtcDiag(
         els.length
           ? `🔊 ${els.length} audio el · ${withTrack} w/track · ${playing} playing · pc:${pc} trk:${trk}${cs ? ` · ${cs}` : ""}`
@@ -583,6 +881,196 @@ export default function Cockpit() {
     }
   }, [api, startMicMeter, pollRemoteAudio, stopDiag]);
 
+  /** Two-tone ring (Swedish-ish 425 Hz cadence) while an inbound call waits for Answer. Refs only → stable. */
+  const startRingTone = useCallback(() => {
+    if (ringToneRef.current) return;
+    try {
+      const ac = new AudioContext();
+      const burst = () => {
+        const o = ac.createOscillator();
+        const g = ac.createGain();
+        o.frequency.value = 425;
+        g.gain.setValueAtTime(0.0001, ac.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.25, ac.currentTime + 0.05);
+        g.gain.setValueAtTime(0.25, ac.currentTime + 0.9);
+        g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + 1);
+        o.connect(g).connect(ac.destination);
+        o.start();
+        o.stop(ac.currentTime + 1.05);
+      };
+      burst();
+      ringToneRef.current = { ac, iv: setInterval(burst, 3000) };
+    } catch {
+      /* no audio context — the banner still shows */
+    }
+    if (typeof document !== "undefined") document.title = "📲 Incoming call — RapidDial";
+  }, []);
+
+  const stopRingTone = useCallback(() => {
+    const t = ringToneRef.current;
+    if (t) {
+      clearInterval(t.iv);
+      t.ac.close().catch(() => {});
+      ringToneRef.current = null;
+    }
+    if (typeof document !== "undefined") document.title = "RapidDial";
+  }, []);
+
+  const answerInbound = useCallback(() => {
+    const sess = ringSessRef.current;
+    if (!sess) return;
+    stopRingTone();
+    setRinging(null);
+    try {
+      sess.answer({ mediaConstraints: { audio: true, video: false } });
+    } catch (e: any) {
+      setError(`Answer failed: ${e?.message || e}`);
+    }
+  }, [stopRingTone]);
+
+  const declineInbound = useCallback(() => {
+    const sess = ringSessRef.current;
+    ringSessRef.current = null;
+    stopRingTone();
+    setRinging(null);
+    try {
+      sess?.terminate({ status_code: 486, reason_phrase: "Busy Here" });
+    } catch {}
+  }, [stopRingTone]);
+
+  /** 46elks browser line — JsSIP WebRTC to +46766861525, no personal phone needed. */
+  const startLineElksRtc = useCallback(async () => {
+    setError(null);
+    startInFlightRef.current = true;
+    ensureRemoteAudioPlayback();
+    await startMicMeter();
+    try {
+      const creds = await fetch("/api/elks/rtc/credentials").then((r) => r.json());
+      if (creds.error) throw new Error(creds.error);
+      try {
+        await api("/api/session/start", { mode: "rtc" });
+      } catch (e: any) {
+        if (!/already active/i.test(String(e?.message))) throw e;
+        await fetch("/api/session/end", { method: "POST" });
+        await api("/api/session/start", { mode: "rtc" });
+      }
+      const JsSIP = (await import("jssip")).default;
+      const socket = new JsSIP.WebSocketInterface(creds.websocket);
+      const ua = new JsSIP.UA({
+        sockets: [socket],
+        uri: creds.sipUri,
+        password: creds.password,
+        session_timers: false,
+      });
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("46elks WebRTC registration timeout (20s)")), 20000);
+        ua.on("registered", () => {
+          clearTimeout(t);
+          resolve();
+        });
+        ua.on("registrationFailed", (e: any) => {
+          clearTimeout(t);
+          reject(new Error(e?.cause || "46elks WebRTC registration failed"));
+        });
+        ua.start();
+      });
+      ua.on("newRTCSession", (e: any) => {
+        const sess = e.session;
+        // One call at a time: a second auto-answer leg while one is up is a duplicate dial — reject it.
+        // Same for the leg of a dial the operator already hung up on while it was being placed.
+        if (e.originator === "remote" && (elksSessionsRef.current.size > 0 || cancelledDialRef.current)) {
+          const ours = String(sess.remote_identity?.uri?.user ?? "").replace(/\D/g, "") === String(creds.number).replace(/\D/g, "");
+          if (Date.now() < expectOutboundUntilRef.current || ours) {
+            cancelledDialRef.current = false;
+            try {
+              sess.terminate({ status_code: 486, reason_phrase: "Busy Here" });
+            } catch {}
+            return;
+          }
+        }
+        elksRtcRef.current.session = sess;
+        elksSessionsRef.current.add(sess);
+        const drop = () => {
+          elksSessionsRef.current.delete(sess);
+          if (elksRtcRef.current.session === sess) elksRtcRef.current.session = null;
+        };
+        sess.on("failed", drop);
+        sess.on("peerconnection", (ev: any) => {
+          // ensureRemoteAudioPlayback() already pipes tracks (+ recorder + speaker sink); fallback only.
+          if ((window as any).__rtcAudioPatched) return;
+          ev.peerconnection.ontrack = () => {
+            const remoteStream = new MediaStream();
+            ev.peerconnection.getReceivers().forEach((r: RTCRtpReceiver) => {
+              if (r.track) remoteStream.addTrack(r.track);
+            });
+            let el = document.getElementById("rtc-remote-audio") as HTMLAudioElement | null;
+            if (!el) {
+              el = document.createElement("audio");
+              el.id = "rtc-remote-audio";
+              el.autoplay = true;
+              document.body.appendChild(el);
+            }
+            el.srcObject = remoteStream;
+            el.play().catch(() => {});
+          };
+        });
+        sess.on("ended", drop);
+        if (e.originator === "remote") {
+          const fromUser = String(sess.remote_identity?.uri?.user ?? "").replace(/\D/g, "");
+          const ours = fromUser === String(creds.number).replace(/\D/g, "");
+          if (Date.now() < expectOutboundUntilRef.current || ours) {
+            expectOutboundUntilRef.current = 0;
+            sess.answer({ mediaConstraints: { audio: true, video: false } });
+          } else {
+            // Real inbound caller: ring in the cockpit until Answer / Decline / caller hangs up.
+            ringSessRef.current = sess;
+            setRinging({ from: fromUser ? `+${fromUser}` : "unknown" });
+            startRingTone();
+            const stop = () => {
+              if (ringSessRef.current === sess) {
+                ringSessRef.current = null;
+                setRinging(null);
+                stopRingTone();
+              }
+            };
+            sess.on("failed", stop);
+            sess.on("ended", stop);
+            sess.on("accepted", stop);
+          }
+        }
+      });
+      elksRtcRef.current.ua = ua;
+      setConnDead(false);
+      pollRemoteAudio();
+      flash(`🇸🇪 46elks browser line live — calling from ${creds.number}`);
+    } catch (e: any) {
+      setError(e?.message || "46elks browser line failed");
+      stopDiag();
+      try {
+        elksRtcRef.current.ua?.stop();
+      } catch {}
+      elksRtcRef.current = { ua: null, session: null };
+      fetch("/api/session/end", { method: "POST" }).catch(() => {});
+    } finally {
+      startInFlightRef.current = false;
+    }
+  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash]);
+
+  const startBrowserLine = useCallback(async () => {
+    if (session) await fetch("/api/session/end", { method: "POST" });
+    // Server is authoritative: a click before the boot's provider switch lands would otherwise
+    // take the Vonage path with stale React state.
+    const live = await fetch("/api/provider")
+      .then((r) => r.json())
+      .then((d) => d.provider as string)
+      .catch(() => provider);
+    if (live === "46elks") {
+      await startLineElksRtc();
+      return;
+    }
+    await startLineRtc();
+  }, [provider, session, startLineRtc, startLineElksRtc]);
+
   const endLine = useCallback(async () => {
     stopDiag();
     const { client, callId } = rtcRef.current;
@@ -594,6 +1082,18 @@ export default function Cockpit() {
         client.deleteSession();
       } catch {}
       rtcRef.current = { client: null, callId: null };
+    }
+    const { ua, session: elksSess } = elksRtcRef.current;
+    if (elksSess) {
+      try {
+        elksSess.terminate();
+      } catch {}
+    }
+    if (ua) {
+      try {
+        ua.stop();
+      } catch {}
+      elksRtcRef.current = { ua: null, session: null };
     }
     api("/api/session/end").then(refresh).catch(() => {});
   }, [api, refresh, stopDiag]);
@@ -612,27 +1112,6 @@ export default function Cockpit() {
     let stopMeter = () => {};
     try {
       // analyser on the remote element's live stream
-      let peak = 0;
-      const el = document.getElementById("rtc-remote-audio") as HTMLAudioElement | null;
-      const ms = (el?.srcObject as MediaStream | null) ?? null;
-      if (ms?.getAudioTracks().length) {
-        const ac = new AudioContext();
-        await ac.resume().catch(() => {});
-        const an = ac.createAnalyser();
-        an.fftSize = 512;
-        ac.createMediaStreamSource(ms).connect(an);
-        const buf = new Uint8Array(an.frequencyBinCount);
-        const iv = setInterval(() => {
-          an.getByteTimeDomainData(buf);
-          let p = 0;
-          for (const v of buf) p = Math.max(p, Math.abs(v - 128));
-          peak = Math.max(peak, p);
-        }, 100);
-        stopMeter = () => {
-          clearInterval(iv);
-          ac.close().catch(() => {});
-        };
-      }
       const senderBytes = async () => {
         let bytes = 0;
         for (const pc of (((window as any).__rtcPcs as RTCPeerConnection[] | undefined) ?? [])) {
@@ -644,9 +1123,45 @@ export default function Cockpit() {
         }
         return bytes;
       };
+      let peak = 0;
+      // Re-attach whenever the remote stream changes: on 46elks the check arrives as a NEW incoming
+      // WebRTC call, so the stream (and its peer connection) don't exist when the check starts.
+      const ac = new AudioContext();
+      await ac.resume().catch(() => {});
+      const an = ac.createAnalyser();
+      an.fftSize = 512;
+      const buf = new Uint8Array(an.frequencyBinCount);
+      let attached: MediaStream | null = null;
+      let src: MediaStreamAudioSourceNode | null = null;
+      const iv = setInterval(() => {
+        const el = document.getElementById("rtc-remote-audio") as HTMLAudioElement | null;
+        const ms = (el?.srcObject as MediaStream | null) ?? null;
+        if (ms && ms !== attached && ms.getAudioTracks().length) {
+          src?.disconnect();
+          src = ac.createMediaStreamSource(ms);
+          src.connect(an);
+          attached = ms;
+        }
+        if (!attached) return;
+        an.getByteTimeDomainData(buf);
+        let p = 0;
+        for (const v of buf) p = Math.max(p, Math.abs(v - 128));
+        peak = Math.max(peak, p);
+      }, 100);
+      let sentMax = 0;
+      const bytesIv = setInterval(() => {
+        senderBytes().then((b) => (sentMax = Math.max(sentMax, b)), () => {});
+      }, 500);
+      stopMeter = () => {
+        clearInterval(iv);
+        clearInterval(bytesIv);
+        ac.close().catch(() => {});
+      };
       const sentBefore = await senderBytes();
+      expectOutboundUntilRef.current = Date.now() + 20_000; // the check arrives as an incoming leg
       const res = await fetch("/api/line-check", { method: "POST" }).then((r) => r.json()); // ~10s: leg joins + speaks
-      const sentAfter = await senderBytes();
+      // Max seen DURING the check: a 46elks test leg hangs up when its clip ends, taking its pc with it.
+      const sentAfter = Math.max(await senderBytes(), sentMax);
       stopMeter();
       const hear = !!res.ok && peak > 5; // harness-proven threshold (TTS peaks 20-60, floor ≤3)
       const send = sentAfter - sentBefore > 10_000; // ≥10kB opus over ~10s = mic genuinely flowing
@@ -665,7 +1180,7 @@ export default function Cockpit() {
 
   // Auto-verify audio once per session, right after the line goes live — before any lead is dialed.
   useEffect(() => {
-    if (!sessionLive || session?.mode !== "rtc" || !rtcRef.current.client) return;
+    if (!sessionLive || session?.mode !== "rtc" || !(rtcRef.current.client || elksRtcRef.current.ua)) return;
     if (checkedSessionRef.current === session.id) return;
     checkedSessionRef.current = session.id;
     const t = setTimeout(() => runLineCheck(), 2500); // give the media leg a beat to settle
@@ -682,13 +1197,22 @@ export default function Cockpit() {
     [api]
   );
 
+  const dialingRef = useRef(false);
   const dial = useCallback(() => {
     const l = leadRef.current;
-    if (!l) return;
+    if (!l || dialingRef.current || callActiveRef.current) return; // never two calls at once
+    dialingRef.current = true;
+    cancelledDialRef.current = false;
+    setDialing(true);
     setOutcome(null);
     setNotes("");
     setDtmfSent("");
-    api("/api/call", { leadId: l.id }).catch(() => {});
+    api("/api/call", { leadId: l.id })
+      .catch(() => {})
+      .finally(() => {
+        dialingRef.current = false;
+        setDialing(false);
+      });
   }, [api]);
 
   // Ad-hoc dial: any number, queue or not. Server creates/reuses a minimal lead row so
@@ -696,7 +1220,10 @@ export default function Cockpit() {
   const [manualNumber, setManualNumber] = useState("");
   const manualDial = useCallback(() => {
     const n = manualNumber.trim();
-    if (!n) return;
+    if (!n || dialingRef.current || callActiveRef.current) return;
+    dialingRef.current = true;
+    cancelledDialRef.current = false;
+    setDialing(true);
     setOutcome(null);
     setNotes("");
     setDtmfSent("");
@@ -705,9 +1232,26 @@ export default function Cockpit() {
         if (d.lead) setLead(d.lead);
         setManualNumber("");
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        dialingRef.current = false;
+        setDialing(false);
+      });
   }, [api, manualNumber]);
-  const hangup = useCallback(() => api("/api/hangup").catch(() => {}), [api]);
+  const hangup = useCallback(() => {
+    const sessions = new Set(elksSessionsRef.current);
+    if (elksRtcRef.current.session) sessions.add(elksRtcRef.current.session);
+    for (const elksSess of sessions) {
+      try {
+        elksSess.terminate();
+      } catch {}
+    }
+    elksSessionsRef.current.clear();
+    elksRtcRef.current.session = null;
+    // A hang up during an in-flight dial still reaches the server, which cancels that leg on return.
+    if (dialingRef.current) cancelledDialRef.current = true;
+    api("/api/hangup").catch(() => {});
+  }, [api]);
 
   const sendBooking = useCallback(() => {
     const l = leadRef.current;
@@ -724,6 +1268,26 @@ export default function Cockpit() {
       .then((d) => flash(`📞 test call ringing ${d.to} — answer it to check audio`))
       .catch((e: any) => setError(e?.message || "Test call failed"));
   }, [api, flash]);
+
+  /**
+   * End-to-end self test on the browser line: a real lead-style dial to the operator's own mobile.
+   * Answer it and talk — phone ↔ browser proves both directions over the exact path a prospect takes.
+   */
+  const callMyPhone = useCallback(() => {
+    if (!operatorPhone) {
+      setError("Set your mobile number first (OPERATOR_PHONE)");
+      return;
+    }
+    setOutcome(null);
+    setNotes("");
+    setDtmfSent("");
+    api("/api/test-call", { number: operatorPhone })
+      .then((d) => {
+        if (d.lead) setLead(d.lead);
+        flash(`📱 ringing ${d.to} — answer and talk: you should hear yourself in the browser and vice versa`);
+      })
+      .catch((e: any) => setError(e?.message || "Test call failed"));
+  }, [api, flash, operatorPhone]);
 
   const saveOutcome = useCallback(
     (skip = false) => {
@@ -833,7 +1397,7 @@ export default function Cockpit() {
             {connDead
               ? "LINE DEAD"
               : sessionLive
-                ? `Line live ${session?.mode === "rtc" ? "· 🎧 browser" : "· 📱 phone"}`
+                ? `Line live ${provider === "46elks" ? "· 🇸🇪 46elks" : session?.mode === "rtc" ? "· 🎧 browser" : "· 📱 phone"}`
                 : session?.status === "starting"
                   ? session?.mode === "rtc"
                     ? "Connecting browser line…"
@@ -874,23 +1438,59 @@ export default function Cockpit() {
             {sessionLive && !callActive && (
               <button
                 onClick={testCall}
-                title="Dials +66838840280 so you can answer and verify two-way audio"
+                title={
+                  provider === "46elks"
+                    ? "Rings your mobile, then bridges to a test number"
+                    : "Dials a test number so you can answer and verify two-way audio"
+                }
                 className="rounded border border-sky-700 px-2.5 py-1 text-sky-300 hover:bg-sky-950"
               >
                 📞 Test audio
               </button>
             )}
+            {sessionLive && !callActive && session?.mode === "rtc" && provider === "46elks" && (
+              <button
+                onClick={callMyPhone}
+                title={`Calls your mobile ${operatorPhone || ""} through the browser line — answer and talk to check both directions`}
+                className="rounded border border-emerald-700 px-2.5 py-1 text-emerald-300 hover:bg-emerald-950"
+              >
+                📱 Call my phone
+              </button>
+            )}
           </>
         ) : (
           <>
-            <button onClick={startLineRtc} className="rounded border border-emerald-700 px-2.5 py-1 text-emerald-300 hover:bg-emerald-950">
+            <button
+              onClick={startBrowserLine}
+              className="rounded border border-emerald-700 px-2.5 py-1 text-emerald-300 hover:bg-emerald-950"
+            >
               🎧 Start line (browser)
             </button>
-            <button onClick={startLine} className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-400 hover:bg-zinc-900">
-              📱 phone
-            </button>
+            {provider === "vonage" && (
+              <button onClick={startLine} className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-400 hover:bg-zinc-900">
+                📱 phone
+              </button>
+            )}
+            {provider === "46elks" && (
+              <button
+                onClick={startLine}
+                title="Rings your mobile first — needs a working phone"
+                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900"
+              >
+                📱 phone (46elks)
+              </button>
+            )}
           </>
         )}
+        <select
+          value={provider}
+          onChange={(e) => switchProvider(e.target.value as "vonage" | "46elks")}
+          title="Telephony provider"
+          className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300 focus:outline-none"
+        >
+          <option value="vonage">Vonage</option>
+          <option value="46elks">46elks 🇸🇪</option>
+        </select>
         <select
           value={region}
           onChange={(e) => changeRegion(e.target.value)}
@@ -971,15 +1571,262 @@ export default function Cockpit() {
             {callerRegion === "US" ? "🇺🇸" : "🇸🇪"} CID {callerId}
             {callerOverride ? " 🔒" : " ·auto"}
           </button>
-          {balance !== null && <span className={balance < 1 ? "text-red-400" : ""}>€{balance.toFixed(2)}</span>}
+          {balance !== null && (
+            <span className={balance < (balanceCurrency === "SEK" ? 5 : 1) ? "text-red-400" : ""}>
+              {balanceCurrency === "SEK" ? `${balance.toFixed(2)} kr` : `€${balance.toFixed(2)}`}
+            </span>
+          )}
           <span>{counts.callsToday} calls today</span>
           <span>{counts.queued} queued</span>
+          {provider === "46elks" && (
+            <button
+              type="button"
+              onClick={() => {
+                setSmsOpen((o) => !o);
+                refreshSmsInbox();
+                refreshVerifyInbox();
+              }}
+              title="Texts + OTP inbox on +46766861525"
+              className="rounded border border-sky-800 px-2 py-0.5 text-sky-300 hover:bg-sky-950"
+            >
+              💬 SMS {smsInbox.length + verifyInbox.length > 0 ? `(${smsInbox.length + verifyInbox.length})` : ""}
+              {verifyRinging ? " 📞" : ""}
+            </button>
+          )}
           <UploadButton onDone={refresh} />
         </span>
       </header>
 
       {(ready || error) && (
         <div className="border-b border-red-900 bg-red-950/60 px-5 py-2 text-sm text-red-300">{error || ready}</div>
+      )}
+
+      {provider === "46elks" && smsOpen && (
+        <div className="border-b border-zinc-800 bg-zinc-900/90 px-5 py-3">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <span className="text-sm text-zinc-300">
+              OTP inbox · <span className="font-mono text-sky-300">+46766861525</span>
+              {verifyRinging ? (
+                <span className="ml-2 animate-pulse text-amber-300">— verification call ringing…</span>
+              ) : verifyMode === "missed" ? (
+                <span className="ml-2 text-emerald-300">— missed-call mode (no answer · CLI digits)</span>
+              ) : verifyMode === "listen" ? (
+                <span className="ml-2 text-amber-200/80">— voice OTP mode (answers + records)</span>
+              ) : (
+                <span className="ml-2 text-zinc-500">— verify capture {verifyMode}</span>
+              )}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void setVerifyModeApi("missed")}
+                title="Meta Missed call: reject immediately, OTP = last digits of caller ID"
+                className={
+                  "rounded border px-2 py-0.5 text-xs " +
+                  (verifyMode === "missed"
+                    ? "border-emerald-600 bg-emerald-950 text-emerald-200"
+                    : "border-zinc-700 text-zinc-400 hover:bg-zinc-800")
+                }
+              >
+                📵 Missed
+              </button>
+              <button
+                type="button"
+                onClick={() => void setVerifyModeApi("listen")}
+                title="Meta Voice call: answer, record spoken OTP"
+                className={
+                  "rounded border px-2 py-0.5 text-xs " +
+                  (verifyMode === "listen"
+                    ? "border-amber-600 bg-amber-950 text-amber-200"
+                    : "border-zinc-700 text-zinc-400 hover:bg-zinc-800")
+                }
+              >
+                🎙 Voice
+              </button>
+              <button
+                type="button"
+                onClick={() => void setVerifyModeApi("off")}
+                title="Disable verify capture"
+                className={
+                  "rounded border px-2 py-0.5 text-xs " +
+                  (verifyMode === "off"
+                    ? "border-zinc-500 bg-zinc-800 text-zinc-200"
+                    : "border-zinc-700 text-zinc-400 hover:bg-zinc-800")
+                }
+              >
+                Off
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  refreshSmsInbox();
+                  refreshVerifyInbox();
+                }}
+                className="rounded border border-zinc-700 px-2 py-0.5 text-xs text-zinc-400 hover:bg-zinc-800"
+              >
+                ↻ refresh
+              </button>
+            </div>
+          </div>
+          {verifyInbox.length > 0 && (
+            <div className="mb-3 space-y-2">
+              <p className="text-xs uppercase tracking-wide text-zinc-500">
+                {verifyMode === "missed" ? "Missed-call OTP (CLI last digits)" : "Voice / missed OTP"}
+              </p>
+              {verifyInbox.map((v) => {
+                const isMissed = (v.transcript || "").startsWith("Missed-call") || (v.id || "").startsWith("missed-");
+                const candidates =
+                  v.transcript?.match(/\b(\d{4,6})(?:\s*\/\s*(\d{4,6}))?(?:\s*\/\s*(\d{4,6}))?\b/g) ||
+                  (v.code ? [v.code] : []);
+                // Prefer explicit last-digit list after "try last digits:"
+                const after = v.transcript?.split("try last digits:")[1];
+                const fromLine = after
+                  ? after
+                      .split("/")
+                      .map((s) => s.trim().replace(/\D/g, ""))
+                      .filter((s) => s.length >= 4 && s.length <= 6)
+                  : [];
+                const codes = fromLine.length ? fromLine : candidates.length ? candidates : v.code ? [v.code] : [];
+                return (
+                  <div
+                    key={v.id}
+                    className={
+                      "rounded border px-3 py-2 text-sm " +
+                      (isMissed
+                        ? "border-emerald-900/60 bg-emerald-950/25"
+                        : "border-amber-900/60 bg-amber-950/30")
+                    }
+                  >
+                    {v.code ? (
+                      <div
+                        className={
+                          "cursor-pointer font-mono text-2xl tracking-widest " +
+                          (isMissed ? "text-emerald-200" : "text-amber-200")
+                        }
+                        onClick={() => {
+                          navigator.clipboard.writeText(v.code!).then(() => flash(`Copied OTP ${v.code}`));
+                        }}
+                        title="Click to copy primary OTP"
+                      >
+                        {v.code}
+                      </div>
+                    ) : (
+                      <div className="text-amber-100/90">{v.transcript || "Waiting…"}</div>
+                    )}
+                    {codes.length > 1 && (
+                      <div className="mt-1.5 flex flex-wrap gap-1.5">
+                        {codes.map((c) => (
+                          <button
+                            key={c}
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(c).then(() => flash(`Copied ${c}`));
+                            }}
+                            className="rounded border border-emerald-800/80 bg-emerald-950/50 px-2 py-0.5 font-mono text-sm text-emerald-200 hover:border-emerald-500"
+                            title={`Copy candidate ${c}`}
+                          >
+                            {c}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <div className="mt-1 text-xs text-zinc-500">
+                      {isMissed && <span className="mr-1 text-emerald-500">missed · </span>}
+                      {v.from_e164 && <span className="font-mono">{v.from_e164} · </span>}
+                      {v.received_at}
+                      {v.transcript && v.code && (
+                        <span className="ml-1 text-zinc-600">· {v.transcript}</span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <form
+            className="mb-2 flex flex-wrap items-center gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void sendSmsNow();
+            }}
+          >
+            <input
+              value={smsTo}
+              onChange={(e) => setSmsTo(e.target.value)}
+              placeholder={lead?.phone_e164 ? `To ${lead.phone_e164} (current lead)` : "To +46… / 07x…"}
+              className="w-48 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-sm text-zinc-200"
+            />
+            <input
+              value={smsBody}
+              onChange={(e) => setSmsBody(e.target.value)}
+              placeholder="Text message…"
+              maxLength={1600}
+              className="min-w-[12rem] flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm text-zinc-200"
+            />
+            <span className="text-xs text-zinc-500">{smsBody.length > 160 ? `${Math.ceil(smsBody.length / 153)} parts` : ""}</span>
+            <button
+              type="submit"
+              disabled={smsSending || !smsBody.trim()}
+              className="rounded border border-sky-700 px-3 py-1 text-sm text-sky-200 hover:bg-sky-950 disabled:opacity-40"
+            >
+              {smsSending ? "Sending…" : "Send"}
+            </button>
+          </form>
+          <div className="max-h-36 space-y-2 overflow-y-auto">
+            {smsInbox.length === 0 ? (
+              <p className="text-sm text-zinc-500">
+                {verifyMode === "missed"
+                  ? "No SMS yet — for Missed call, wait for Meta to ring then use CLI digits above"
+                  : "No SMS yet — Meta usually cannot SMS VoIP numbers"}
+              </p>
+            ) : (
+              smsInbox.map((m) => (
+                <div
+                  key={m.id}
+                  className="cursor-pointer rounded border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm hover:border-zinc-600"
+                  onClick={() => {
+                    const code = m.message?.match(/\d{6}/)?.[0];
+                    const copy = code || m.message || "";
+                    navigator.clipboard.writeText(copy).then(() => flash(code ? `Copied OTP ${code}` : "Copied message"));
+                  }}
+                  title="Click to copy OTP or full message"
+                >
+                  <div className="flex justify-between gap-2 text-xs text-zinc-500">
+                    {(m.from_e164 || "").replace(/\D/g, "") === "46766861525" ? (
+                      <span className="font-mono text-sky-400">→ {m.to_e164} (sent)</span>
+                    ) : (
+                      <span className="font-mono">
+                        {m.from_e164}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSmsTo(m.from_e164 || "");
+                          }}
+                          className="ml-2 text-sky-400 hover:underline"
+                        >
+                          reply
+                        </button>
+                      </span>
+                    )}
+                    <span>{m.received_at}</span>
+                  </div>
+                  <p className="mt-1 text-zinc-200">
+                    {(m.message || "").split(/(\d{6})/).map((part, i) =>
+                      /^\d{6}$/.test(part) ? (
+                        <span key={i} className="rounded bg-emerald-950 px-1.5 py-0.5 font-bold text-emerald-300">
+                          {part}
+                        </span>
+                      ) : (
+                        <span key={i}>{part}</span>
+                      )
+                    )}
+                  </p>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
       )}
       {connDead && session?.mode === "rtc" && (
         <div className="border-b border-red-900 bg-red-950/80 px-5 py-2 text-sm font-medium text-red-200">
@@ -989,6 +1836,27 @@ export default function Cockpit() {
       )}
       {toast && (
         <div className="border-b border-sky-900 bg-sky-950/60 px-5 py-2 text-sm text-sky-200">{toast}</div>
+      )}
+      {ringing && (
+        <div className="flex items-center gap-3 border-b border-emerald-600 bg-emerald-900/70 px-5 py-3 text-sm">
+          <span className="animate-pulse text-lg">📞</span>
+          <span className="font-semibold text-emerald-50">
+            Incoming call <span className="ml-1 font-mono text-emerald-300">{ringing.from}</span>
+            {inbound?.lead && <span className="ml-2 font-normal text-emerald-200">— {inbound.lead.company}</span>}
+          </span>
+          <button
+            onClick={answerInbound}
+            className="ml-auto rounded bg-emerald-500 px-4 py-1.5 font-semibold text-emerald-950 hover:bg-emerald-400"
+          >
+            Answer
+          </button>
+          <button
+            onClick={declineInbound}
+            className="rounded border border-red-700 px-3 py-1.5 text-red-300 hover:bg-red-950"
+          >
+            Decline
+          </button>
+        </div>
       )}
       {inbound && (
         <div className="flex items-center gap-3 border-b border-emerald-800 bg-emerald-950/60 px-5 py-2.5 text-sm">

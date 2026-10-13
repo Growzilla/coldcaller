@@ -12,7 +12,19 @@
     "test-call": "tsx scripts/test-call.ts",
     "export-log": "tsx scripts/export-call-log.ts",
     "tunnel": "tsx scripts/tunnel.ts",
-    "digest": "tsx scripts/digest.ts"
+    "digest": "tsx scripts/digest.ts",
+    "elks-test": "node scripts/elks-smoke-test.mjs",
+    "elks-sms-setup": "tsx scripts/setup-elks-sms.ts",
+    "elks:webrtc": "tsx scripts/setup-elks-webrtc.ts",
+    "elks-sms-test": "node scripts/elks-sms-smoke-test.mjs",
+    "sms-listen": "./sms-listen",
+    "ghl": "tsx scripts/ghl.ts",
+    "review:import": "tsx scripts/review-import.ts",
+    "review:rank": "tsx scripts/review-rank.ts",
+    "review:sites": "tsx scripts/review-verify-sites.ts",
+    "review:csv": "tsx scripts/review-ghl-csv.ts",
+    "review:cleanup": "tsx scripts/review-ghl-cleanup.ts",
+    "review:apply-rows": "tsx scripts/review-ghl-apply-rows.ts"
   },
   "dependencies": {
     "@vonage/client-sdk": "^2.3.1",
@@ -20,6 +32,7 @@
     "@vonage/server-sdk": "^3.27.0",
     "better-sqlite3": "^12.10.0",
     "csv-parse": "^6.2.1",
+    "jssip": "^3.13.8",
     "next": "14.2.35",
     "react": "^18",
     "react-dom": "^18"

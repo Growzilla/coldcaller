@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { endSession } from "@/lib/vonage";
+import { endSession } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 

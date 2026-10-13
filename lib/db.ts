@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS sessions (
   started_at TEXT DEFAULT (datetime('now')),
   ended_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS inbound_sms (
+  id TEXT PRIMARY KEY,
+  from_e164 TEXT,
+  to_e164 TEXT,
+  message TEXT,
+  created_at TEXT,
+  received_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_inbound_sms_received ON inbound_sms(received_at DESC);
 `;
 
 export function getDb(): Database.Database {
@@ -62,9 +72,53 @@ export function getDb(): Database.Database {
     for (const col of ["recording_path TEXT", "transcript TEXT", "analysis TEXT"]) {
       if (!callCols.includes(col.split(" ")[0])) db.exec(`ALTER TABLE calls ADD COLUMN ${col}`);
     }
+    // GHL sync (lib/ghl.ts): ids link a lead to its GHL contact/opportunity; per-call sync markers.
+    const leadCols = (db.pragma("table_info(leads)") as { name: string }[]).map((c) => c.name);
+    // score = ICP score from GHL (higher = better lead); NULL for legacy CSV leads → they sort last.
+    for (const col of ["ghl_contact_id TEXT", "ghl_opportunity_id TEXT", "score REAL"]) {
+      if (!leadCols.includes(col.split(" ")[0])) db.exec(`ALTER TABLE leads ADD COLUMN ${col}`);
+    }
+    db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_ghl_contact ON leads(ghl_contact_id)");
+    for (const col of ["ghl_synced_at TEXT", "ghl_intel_synced_at TEXT", "ghl_error TEXT"]) {
+      if (!callCols.includes(col.split(" ")[0])) db.exec(`ALTER TABLE calls ADD COLUMN ${col}`);
+    }
     db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS inbound_sms (
+        id TEXT PRIMARY KEY,
+        from_e164 TEXT,
+        to_e164 TEXT,
+        message TEXT,
+        created_at TEXT,
+        received_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_inbound_sms_received ON inbound_sms(received_at DESC);
+      CREATE TABLE IF NOT EXISTS inbound_verify (
+        id TEXT PRIMARY KEY,
+        callid TEXT,
+        from_e164 TEXT,
+        code TEXT,
+        transcript TEXT,
+        wav_path TEXT,
+        received_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_inbound_verify_received ON inbound_verify(received_at DESC);
+    `);
     globalThis.__dialerDb = db;
   }
+  // Late migrations — must run even when __dialerDb already exists (hot reload).
+  globalThis.__dialerDb.exec(`
+    CREATE TABLE IF NOT EXISTS inbound_verify (
+      id TEXT PRIMARY KEY,
+      callid TEXT,
+      from_e164 TEXT,
+      code TEXT,
+      transcript TEXT,
+      wav_path TEXT,
+      received_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_inbound_verify_received ON inbound_verify(received_at DESC);
+  `);
   return globalThis.__dialerDb;
 }
 
@@ -86,6 +140,9 @@ export type Lead = {
   priority: number;
   status: string;
   prior_notes: string | null;
+  ghl_contact_id?: string | null;
+  ghl_opportunity_id?: string | null;
+  score?: number | null;
 };
 
 export type CallRow = {
@@ -120,7 +177,7 @@ const sourceArgs = (source?: string | null) => (source ? [source] : []);
 export function nextLead(country?: string | null, source?: string | null): Lead | undefined {
   return getDb()
     .prepare(
-      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, id LIMIT 1`
+      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, score DESC, id LIMIT 1`
     )
     .get(...countryArgs(country), ...sourceArgs(source)) as Lead | undefined;
 }
@@ -128,7 +185,7 @@ export function nextLead(country?: string | null, source?: string | null): Lead 
 export function queuePreview(country?: string | null, source?: string | null, limit = 12): Lead[] {
   return getDb()
     .prepare(
-      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, id LIMIT ?`
+      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, score DESC, id LIMIT ?`
     )
     .all(...countryArgs(country), ...sourceArgs(source), limit) as Lead[];
 }
@@ -199,4 +256,67 @@ export function activeCall(): (CallRow & { company: string }) | undefined {
        WHERE c.ended_at IS NULL AND c.vonage_uuid IS NOT NULL ORDER BY c.id DESC LIMIT 1`
     )
     .get() as (CallRow & { company: string }) | undefined;
+}
+
+export type InboundSmsRow = {
+  id: string;
+  from_e164: string | null;
+  to_e164: string | null;
+  message: string | null;
+  created_at: string | null;
+  received_at: string;
+};
+
+/** Store an inbound SMS from the 46elks webhook (idempotent on message id). */
+export function insertInboundSms(row: {
+  id: string;
+  from_e164: string;
+  to_e164: string;
+  message: string;
+  created_at?: string | null;
+}): InboundSmsRow | undefined {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO inbound_sms (id, from_e164, to_e164, message, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).run(row.id, row.from_e164, row.to_e164, row.message, row.created_at ?? null);
+  return db.prepare("SELECT * FROM inbound_sms WHERE id=?").get(row.id) as InboundSmsRow | undefined;
+}
+
+export function listInboundSms(limit = 20): InboundSmsRow[] {
+  return getDb()
+    .prepare("SELECT * FROM inbound_sms ORDER BY received_at DESC LIMIT ?")
+    .all(limit) as InboundSmsRow[];
+}
+
+export type InboundVerifyRow = {
+  id: string;
+  callid: string | null;
+  from_e164: string | null;
+  code: string | null;
+  transcript: string | null;
+  wav_path: string | null;
+  received_at: string;
+};
+
+export function insertInboundVerify(row: {
+  id: string;
+  callid: string;
+  from_e164: string | null;
+  code: string | null;
+  transcript: string | null;
+  wav_path?: string | null;
+}): InboundVerifyRow | undefined {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR REPLACE INTO inbound_verify (id, callid, from_e164, code, transcript, wav_path)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(row.id, row.callid, row.from_e164, row.code, row.transcript, row.wav_path ?? null);
+  return db.prepare("SELECT * FROM inbound_verify WHERE id=?").get(row.id) as InboundVerifyRow | undefined;
+}
+
+export function listInboundVerify(limit = 10): InboundVerifyRow[] {
+  return getDb()
+    .prepare("SELECT * FROM inbound_verify ORDER BY received_at DESC LIMIT ?")
+    .all(limit) as InboundVerifyRow[];
 }
