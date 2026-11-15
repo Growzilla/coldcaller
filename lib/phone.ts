@@ -1,3 +1,5 @@
+import { swedishNumberKind } from "./sms/logic";
+
 /**
  * Normalize messy CSV phone values to E.164.
  * Handles: "+46 8 703 25 60", "08-703 25 60" (SE), "587-859-6888" (NA), "0046...".
@@ -25,3 +27,22 @@ export function toE164(raw: string | null | undefined, defaultCountry: "SE" | "N
   if (s.length === 11 && s.startsWith("1")) return "+" + s;
   return null;
 }
+
+/**
+ * Numbers the dialer will load. Swedish and Australian prefixes say mobile vs landline.
+ * Other countries (NANP especially) do not, so those numbers stay dialable.
+ * SE mobiles: 070/071/072/073/076/079, 9 national digits. AU mobiles: 04, 9 national digits.
+ */
+export function isDialableMobile(e164: string | null | undefined): boolean {
+  if (!e164) return false;
+  if (e164.startsWith("+46")) return swedishNumberKind(e164) === "mobile";
+  if (e164.startsWith("+61")) return /^\+614\d{8}$/.test(e164);
+  return true;
+}
+
+/** Same rule as isDialableMobile, for the queue SQL. `phone_e164` is the column name. */
+export const DIALABLE_MOBILE_SQL = `(
+  ((phone_e164 LIKE '+4670%' OR phone_e164 LIKE '+4671%' OR phone_e164 LIKE '+4672%' OR phone_e164 LIKE '+4673%' OR phone_e164 LIKE '+4676%' OR phone_e164 LIKE '+4679%') AND length(phone_e164) = 12)
+  OR (phone_e164 LIKE '+614%' AND length(phone_e164) = 12)
+  OR (phone_e164 NOT LIKE '+46%' AND phone_e164 NOT LIKE '+61%')
+)`;

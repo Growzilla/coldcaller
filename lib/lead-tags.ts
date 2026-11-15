@@ -57,7 +57,7 @@ export function tagValue(s: string): string {
 
 // ── contact person ───────────────────────────────────────────────────────
 
-const FIRST_NAMES = new Set(
+export const FIRST_NAMES = new Set(
   ("adam agneta albin alexander alf alice allan alva anders andreas anette ann anna anne annika ante anton arne arvid " +
     "axel bengt benny bernt bertil birgitta bjarne björn bo bror camilla carina carl carola caroline cecilia charlotte " +
     "christer christian christina christoffer claes conny dan daniel david dennis ebba edvard elias elin elisabeth elsa " +

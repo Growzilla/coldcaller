@@ -7,6 +7,7 @@ import { getElksVerifyMode, getElksWebhookBase, getOperatorPhone } from "@/lib/p
 import { publish } from "@/lib/bus";
 import { isSignedWebhook, signWebhookUrl } from "@/lib/elks";
 import { elksWebrtcUser, ensureWebrtcNumber } from "@/lib/elks-rtc";
+import { notifyInboundCall } from "@/lib/sms/inbound";
 
 export const dynamic = "force-dynamic";
 
@@ -131,6 +132,8 @@ export async function POST(req: Request) {
       )
       .run(lead?.id ?? null, callid);
     publish({ type: "inbound", payload: { from: e164, lead: lead ?? null, stats } });
+    // Alert the operator by SMS. Do not delay the connect action on this.
+    void notifyInboundCall(e164, callid);
   }
 
   // Behave like a normal phone: every inbound call rings the operator's mobile (verify modes

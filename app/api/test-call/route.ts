@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDb } from "@/lib/db";
+import { activeSession, getDb } from "@/lib/db";
 import { dialLead, getDialerProvider, getOperatorPhone, runLineCheck } from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
@@ -37,7 +37,8 @@ export async function POST(req: Request) {
 
     const callId = await dialLead(lead.id);
     // lead → the cockpit swaps its card to the test lead so the wrapup can't land on a real prospect.
-    return NextResponse.json({ callId, to: number, lead });
+    const originate = getDialerProvider() === "twilio" && activeSession()?.mode === "rtc";
+    return NextResponse.json({ callId, to: number, lead, originate });
   } catch (err: any) {
     return NextResponse.json({ error: err?.message || "Test call failed" }, { status: 400 });
   }

@@ -1,7 +1,10 @@
 import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
+import { leadClock, leadInCallWindow, leadTimeZone, openWindowLabel } from "./call-window";
 import { config } from "./config";
+import { DIALABLE_MOBILE_SQL } from "./phone";
+import { ensureSmsSchema } from "./sms/schema";
 
 declare global {
   // eslint-disable-next-line no-var
@@ -18,7 +21,7 @@ CREATE TABLE IF NOT EXISTS leads (
   city TEXT, country TEXT, industry TEXT, employees TEXT,
   source_file TEXT,
   priority INTEGER DEFAULT 2,           -- 0 callback-due, 1 high-value, 2 standard
-  status TEXT DEFAULT 'queued',         -- queued | done | skipped
+  status TEXT DEFAULT 'queued',         -- queued | done | skipped | passed (passed = not needed, never re-queued)
   prior_notes TEXT,
   created_at TEXT DEFAULT (datetime('now'))
 );
@@ -119,6 +122,22 @@ export function getDb(): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_inbound_verify_received ON inbound_verify(received_at DESC);
   `);
+  // snooze_until: "Later" in the cockpit hides a lead from the queue until then (it stays queued).
+  const leadColsNow = (globalThis.__dialerDb.pragma("table_info(leads)") as { name: string }[]).map((c) => c.name);
+  if (!leadColsNow.includes("snooze_until")) globalThis.__dialerDb.exec("ALTER TABLE leads ADD COLUMN snooze_until TEXT");
+  // Google fit (lib/maps-fit.ts). maps_fit='suitable' is the only value the queue will dial
+  // once meta queue_maps_only=1. Anything else was checked and failed, or not checked yet.
+  for (const col of ["maps_fit TEXT", "maps_reason TEXT", "gbp_status TEXT", "maps_checked_at TEXT", "maps_rank INTEGER"]) {
+    if (!leadColsNow.includes(col.split(" ")[0])) globalThis.__dialerDb.exec(`ALTER TABLE leads ADD COLUMN ${col}`);
+  }
+  ensureSmsSchema(globalThis.__dialerDb);
+  // Depends on the clock, so not deterministic — SQLite must not cache it.
+  globalThis.__dialerDb.function(
+    "in_call_window",
+    { deterministic: false },
+    (city: string | null, country: string | null, notes: string | null) =>
+      leadInCallWindow({ city, country, prior_notes: notes }) ? 1 : 0
+  );
   return globalThis.__dialerDb;
 }
 
@@ -143,6 +162,14 @@ export type Lead = {
   ghl_contact_id?: string | null;
   ghl_opportunity_id?: string | null;
   score?: number | null;
+  maps_fit?: string | null;
+  maps_reason?: string | null;
+  gbp_status?: string | null;
+  maps_rank?: number | null;
+  /** "Perth 14:05" when the lead's zone is known. Not a column. */
+  call_local?: string | null;
+  /** True when call_local sits in 09:00–12:00 or 13:00–16:00. */
+  call_open?: boolean;
 };
 
 export type CallRow = {
@@ -171,31 +198,143 @@ export type SessionRow = {
 const countryWhere = (country?: string | null) => (country ? " AND country=?" : "");
 const countryArgs = (country?: string | null) => (country ? [country] : []);
 /** Optional source filter (the import file a lead came from) — lets you dial one batch. */
-const sourceWhere = (source?: string | null) => (source ? " AND source_file=?" : "");
-const sourceArgs = (source?: string | null) => (source ? [source] : []);
+const sourceWhere = (source?: string | null) =>
+  source === REVENUE_1_5M_SOURCE ? REVENUE_1_5M_SQL : source ? " AND source_file=?" : "";
+const sourceArgs = (source?: string | null) => (source && source !== REVENUE_1_5M_SOURCE ? [source] : []);
+/** Virtual source: leads with 1–5 MSEK revenue, read from the "· oms 3.2 MSEK" text in prior_notes.
+ *  Only batches that carry that text can match (today: se-electricians-v2-*). */
+const REVENUE_1_5M_SOURCE = "oms:1-5MSEK";
+const REVENUE_1_5M_SQL =
+  " AND prior_notes LIKE '%· oms % MSEK%' AND CAST(substr(prior_notes, instr(prior_notes, '· oms ') + 6) AS REAL) BETWEEN 1 AND 5";
+/** Queue gate: leads put off with "Later" stay hidden until their time. */
+const gateWhere = () => " AND (snooze_until IS NULL OR snooze_until <= datetime('now'))";
+/**
+ * Google fit gate. Off until `npm run maps:fit -- --apply` has stamped the queue.
+ * Callbacks (priority 0) stay, because those are people we already promised to call.
+ * Every other lead must be maps_fit='suitable': not shown for "{trade} {city}".
+ */
+export function mapsOnly(): boolean {
+  const row = getDb().prepare("SELECT value FROM meta WHERE key='queue_maps_only'").get() as { value: string } | undefined;
+  return row?.value === "1";
+}
+const mapsGate = () => (mapsOnly() ? " AND (priority = 0 OR maps_fit = 'suitable')" : "");
+/** Callbacks first, then no-Business-Profile small towns, then the rest of the cleared leads. */
+const mapsRank = () => (mapsOnly() ? "CASE WHEN priority = 0 THEN -1 ELSE COALESCE(maps_rank, 9) END, " : "");
+/** Swedish and Australian landlines stay out of the queue. Other countries pass through. */
+const mobileWhere = () => ` AND ${DIALABLE_MOBILE_SQL}`;
+
+/** Move queued SE/AU landlines (and short invalid mobiles) to status `landline`. Reversible. */
+export function holdNonMobiles(): number {
+  return getDb()
+    .prepare(`UPDATE leads SET status='landline' WHERE status='queued' AND phone_e164 IS NOT NULL AND NOT ${DIALABLE_MOBILE_SQL}`)
+    .run().changes;
+}
+/** "New leads first": never-dialed leads come up newest-import first. Already-called leads stay
+ *  queued behind them. Off = the normal order, priority (callbacks and pins) on top. */
+const queueOrder = () =>
+  `${freshOnly() ? "EXISTS (SELECT 1 FROM calls c WHERE c.lead_id=leads.id), leads.created_at DESC, " : ""}${mapsRank()}priority, score DESC, id`;
+
+const queueFilter = (country?: string | null, source?: string | null) =>
+  `status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)}${gateWhere()}${mapsGate()}${mobileWhere()}`;
+
+/**
+ * While any dialable lead is inside 09–12 or 13–16 local, the queue is just those
+ * (callbacks still jump it — they were promised). Outside every window the normal
+ * queue returns, so an evening session is not an empty screen.
+ * Memoized for a second: /api/state asks for the next lead, the preview, and the count together.
+ */
+let windowGateMemo: { key: string; at: number; sql: string } | null = null;
+function windowGate(country?: string | null, source?: string | null): string {
+  const key = `${country ?? ""}\0${source ?? ""}\0${mapsOnly() ? 1 : 0}`;
+  const now = Date.now();
+  if (windowGateMemo && windowGateMemo.key === key && now - windowGateMemo.at < 1000) return windowGateMemo.sql;
+  const open = getDb()
+    .prepare(
+      `SELECT 1 AS ok FROM leads WHERE ${queueFilter(country, source)} AND priority != 0 AND in_call_window(city, country, prior_notes) = 1 LIMIT 1`
+    )
+    .get(...countryArgs(country), ...sourceArgs(source));
+  const sql = open ? ` AND (priority = 0 OR in_call_window(city, country, prior_notes) = 1)` : "";
+  windowGateMemo = { key, at: now, sql };
+  return sql;
+}
+
+function stampClock<T extends Lead>(row: T): T {
+  if (!leadTimeZone(row)) return row;
+  return { ...row, call_local: leadClock(row), call_open: leadInCallWindow(row) };
+}
+
+export function freshOnly(): boolean {
+  const row = getDb().prepare("SELECT value FROM meta WHERE key='queue_fresh_only'").get() as { value: string } | undefined;
+  return row?.value === "1";
+}
+
+export function setFreshOnly(on: boolean) {
+  getDb()
+    .prepare("INSERT INTO meta (key, value) VALUES ('queue_fresh_only', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .run(on ? "1" : "0");
+}
+
+/** Put a lead off for `hours` — it drops out of the queue and comes back on its own afterwards. */
+export function snoozeLead(id: number, hours: number) {
+  getDb().prepare("UPDATE leads SET snooze_until=datetime('now', ?) WHERE id=?").run(`+${hours} hours`, id);
+}
+
+/** Remember the lead the operator just wrapped, so Undo restores that one even when no call row exists. */
+export function rememberWrapup(leadId: number) {
+  getDb()
+    .prepare("INSERT INTO meta (key, value) VALUES ('last_wrapup_lead', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .run(String(leadId));
+}
+
+/** Lead id from the last wrapup, if any. Cleared so a second Undo falls through to the previous call. */
+export function takeLastWrapup(): number | null {
+  const db = getDb();
+  const row = db.prepare("SELECT value FROM meta WHERE key='last_wrapup_lead'").get() as { value: string } | undefined;
+  if (!row) return null;
+  db.prepare("DELETE FROM meta WHERE key='last_wrapup_lead'").run();
+  const id = Number(row.value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/**
+ * "Not needed" — the operator looked at this lead and it is not one we can help.
+ * Status `passed` is sticky: the queue, a GHL pull, and a call-log import will not bring it back.
+ * Undo is the way to reverse a misclick.
+ */
+export function passLead(id: number) {
+  getDb().prepare("UPDATE leads SET status='passed', snooze_until=NULL WHERE id=?").run(id);
+  rememberWrapup(id);
+}
 
 export function nextLead(country?: string | null, source?: string | null): Lead | undefined {
-  return getDb()
-    .prepare(
-      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, score DESC, id LIMIT 1`
-    )
+  const row = getDb()
+    .prepare(`SELECT * FROM leads WHERE ${queueFilter(country, source)}${windowGate(country, source)} ORDER BY ${queueOrder()} LIMIT 1`)
     .get(...countryArgs(country), ...sourceArgs(source)) as Lead | undefined;
+  return row ? stampClock(row) : undefined;
 }
 
 export function queuePreview(country?: string | null, source?: string | null, limit = 12): Lead[] {
-  return getDb()
-    .prepare(
-      `SELECT * FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)} ORDER BY priority, score DESC, id LIMIT ?`
-    )
-    .all(...countryArgs(country), ...sourceArgs(source), limit) as Lead[];
+  return (
+    getDb()
+      .prepare(`SELECT * FROM leads WHERE ${queueFilter(country, source)}${windowGate(country, source)} ORDER BY ${queueOrder()} LIMIT ?`)
+      .all(...countryArgs(country), ...sourceArgs(source), limit) as Lead[]
+  ).map(stampClock);
 }
 
 export function queueCounts(country?: string | null, source?: string | null) {
   const db = getDb();
+  const gate = windowGate(country, source);
   return {
-    queued: (db.prepare(`SELECT COUNT(*) c FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)}`).get(...countryArgs(country), ...sourceArgs(source)) as any).c,
+    queued: (db.prepare(`SELECT COUNT(*) c FROM leads WHERE ${queueFilter(country, source)}${gate}`).get(...countryArgs(country), ...sourceArgs(source)) as any).c,
     done: (db.prepare("SELECT COUNT(*) c FROM leads WHERE status='done'").get() as any).c,
     callsToday: (db.prepare("SELECT COUNT(*) c FROM calls WHERE date(started_at)=date('now')").get() as any).c,
+    /** True once the Google fit gate is on. The cockpit uses it to explain a shorter queue. */
+    mapsOnly: mapsOnly(),
+    /** "Perth 14:05 · Darwin 15:35" while the queue is restricted to a calling block. Empty otherwise. */
+    callWindow: gate ? openWindowLabel(country) : "",
+    mapsHidden: mapsOnly()
+      ? (db.prepare(`SELECT COUNT(*) c FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${countryWhere(country)}${sourceWhere(source)}${gateWhere()}${mobileWhere()} AND NOT (priority = 0 OR maps_fit = 'suitable')`).get(...countryArgs(country), ...sourceArgs(source)) as any).c
+      : 0,
   };
 }
 
@@ -203,7 +342,7 @@ export function queueCounts(country?: string | null, source?: string | null) {
 export function countryBreakdown(): { country: string; n: number }[] {
   return getDb()
     .prepare(
-      "SELECT country, COUNT(*) n FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL AND country IS NOT NULL GROUP BY country ORDER BY n DESC"
+      `SELECT country, COUNT(*) n FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL AND country IS NOT NULL${mapsGate()}${mobileWhere()} GROUP BY country ORDER BY n DESC`
     )
     .all() as { country: string; n: number }[];
 }
@@ -211,11 +350,15 @@ export function countryBreakdown(): { country: string; n: number }[] {
 /** Source-file breakdown of the dialable queue, most-recent batch first (by max id).
  *  Feeds the cockpit "source" dropdown so you can isolate the latest import. */
 export function sourceBreakdown(): { source: string; n: number }[] {
-  return getDb()
+  const batches = getDb()
     .prepare(
-      "SELECT source_file source, COUNT(*) n, MAX(id) latest FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL AND source_file IS NOT NULL GROUP BY source_file ORDER BY latest DESC"
+      `SELECT source_file source, COUNT(*) n, MAX(id) latest FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL AND source_file IS NOT NULL${mapsGate()}${mobileWhere()} GROUP BY source_file ORDER BY latest DESC`
     )
     .all() as { source: string; n: number }[];
+  const revenue = getDb()
+    .prepare(`SELECT COUNT(*) n FROM leads WHERE status='queued' AND phone_e164 IS NOT NULL${REVENUE_1_5M_SQL}${mapsGate()}${mobileWhere()}`)
+    .get() as { n: number };
+  return revenue.n > 0 ? [...batches, { source: REVENUE_1_5M_SOURCE, n: revenue.n }] : batches;
 }
 
 export function activeSession(): SessionRow | undefined {
@@ -298,10 +441,28 @@ export function insertInboundSms(row: {
   return db.prepare("SELECT * FROM inbound_sms WHERE id=?").get(row.id) as InboundSmsRow | undefined;
 }
 
-export function listInboundSms(limit = 20): InboundSmsRow[] {
+/** Inbound/sent SMS with the matching lead (by the other party's number) so the inbox can show the company. */
+export function listInboundSms(limit = 20): (InboundSmsRow & {
+  lead_id: number | null;
+  lead_company: string | null;
+  lead_name: string | null;
+})[] {
   return getDb()
-    .prepare("SELECT * FROM inbound_sms ORDER BY received_at DESC LIMIT ?")
-    .all(limit) as InboundSmsRow[];
+    .prepare(
+      `SELECT s.*, l.id lead_id, l.company lead_company,
+              NULLIF(TRIM(COALESCE(l.first_name,'') || ' ' || COALESCE(l.last_name,'')), '') lead_name
+       FROM inbound_sms s
+       LEFT JOIN leads l ON l.id = (
+         SELECT id FROM leads
+         WHERE phone_e164 = CASE WHEN s.from_e164 = ? THEN s.to_e164 ELSE s.from_e164 END
+         ORDER BY id DESC LIMIT 1)
+       ORDER BY s.received_at DESC LIMIT ?`
+    )
+    .all(config.elksNumber || "", limit) as (InboundSmsRow & {
+    lead_id: number | null;
+    lead_company: string | null;
+    lead_name: string | null;
+  })[];
 }
 
 export type InboundVerifyRow = {

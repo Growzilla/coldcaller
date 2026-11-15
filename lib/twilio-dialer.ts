@@ -1,7 +1,7 @@
-import { callerIdForCountry, config } from "./config";
+import { config, leadFitsTwilioLine, twilioNumberForLine } from "./config";
 import { getDb, activeSession, activeCall, openCalls, type Lead, type SessionRow } from "./db";
 import { publish } from "./bus";
-import { getElksWebhookBase, getOperatorPhone } from "./provider";
+import { getElksWebhookBase, getOperatorPhone, getTwilioLine } from "./provider";
 import {
   childCalls,
   dialTwiml,
@@ -10,6 +10,7 @@ import {
   hangupCall,
   makeCall,
   playTwiml,
+  upsertVoiceApp,
   type TwilioCall,
 } from "./twilio";
 
@@ -26,13 +27,75 @@ export const TWILIO_LINE_CHECK_CLIP = "https://demo.twilio.com/docs/classic.mp3"
  * its inline TwiML <Dial>s the lead as a CHILD call. Parent status = operator leg; the lead's
  * answer/busy/no-answer lives on the child.
  */
+/** Identity of the browser line that just started. Old tabs keep their previous name. */
+export function currentTwilioIdentity(): string {
+  const row = getDb().prepare("SELECT value FROM meta WHERE key='twilio_client_identity'").get() as
+    | { value?: string }
+    | undefined;
+  return row?.value || config.twilioClientIdentity;
+}
+
+/** New name per Start line, so a leftover tab cannot 486 this line's calls. */
+export function rotateTwilioIdentity(): string {
+  const id = `rapiddial-${Date.now().toString(36)}`;
+  getDb()
+    .prepare(
+      "INSERT INTO meta (key, value) VALUES ('twilio_client_identity', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+    )
+    .run(id);
+  return id;
+}
+
 const operatorTarget = (mode: string) =>
-  mode === "rtc" ? `client:${config.twilioClientIdentity}` : getOperatorPhone();
+  mode === "rtc" ? `client:${currentTwilioIdentity()}` : getOperatorPhone();
 
 /** Public base for status callbacks — the same tunnel URL 46elks uses (set by `npm run tunnel`). */
 export function statusCallbackUrl(dbCallId: number): string | undefined {
   const base = getElksWebhookBase();
   return base ? `${base}/api/twilio/status?dbCallId=${dbCallId}` : undefined;
+}
+
+const HANGUP_TWIML = "<Response><Hangup/></Response>";
+
+/** TwiML App the browser Device.connects to. VoiceUrl is refreshed on every token. */
+export async function ensureBrowserVoiceApp(): Promise<string> {
+  const base = getElksWebhookBase();
+  if (!base) throw new Error("No public webhook URL — the tunnel is down, so the browser cannot place calls");
+  const voiceUrl = `${base}/api/twilio/client-voice`;
+  const row = getDb().prepare("SELECT value FROM meta WHERE key='twilio_app_sid'").get() as { value?: string } | undefined;
+  const sid = await upsertVoiceApp(row?.value || null, voiceUrl);
+  getDb()
+    .prepare("INSERT INTO meta (key, value) VALUES ('twilio_app_sid', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .run(sid);
+  console.log("[twilio] voice app", sid, voiceUrl);
+  return sid;
+}
+
+/**
+ * TwiML for a browser-originated call. The lead number comes from the calls row.
+ * A number in the POST body is ignored so the browser cannot dial an arbitrary target.
+ */
+export function twimlForClientCall(dbCallId: number, callSid: string): string {
+  const db = getDb();
+  const call = db
+    .prepare(
+      `SELECT c.id, c.ended_at, c.vonage_uuid, l.phone_e164
+       FROM calls c LEFT JOIN leads l ON l.id = c.lead_id
+       WHERE c.id = ?`
+    )
+    .get(dbCallId) as
+    | { id: number; ended_at: string | null; vonage_uuid: string | null; phone_e164: string | null }
+    | undefined;
+  if (!call || call.ended_at || !call.phone_e164) return HANGUP_TWIML;
+  if (call.vonage_uuid && call.vonage_uuid !== callSid) return HANGUP_TWIML;
+  const from = twilioNumberForLine(getTwilioLine());
+  if (!from) return HANGUP_TWIML;
+  if (!call.vonage_uuid) {
+    db.prepare("UPDATE calls SET vonage_uuid=?, vonage_status='ringing' WHERE id=? AND ended_at IS NULL").run(callSid, dbCallId);
+  }
+  publishCall();
+  ensurePoller();
+  return dialTwiml(call.phone_e164, from);
 }
 
 export async function startSession(mode: "phone" | "rtc" = "phone"): Promise<SessionRow> {
@@ -68,17 +131,31 @@ export async function dialLead(leadId: number): Promise<number> {
 
   const lead = db.prepare("SELECT * FROM leads WHERE id=?").get(leadId) as Lead | undefined;
   if (!lead?.phone_e164) throw new Error("Lead not found or has no phone number");
-  const to = operatorTarget(session.mode);
-  if (!to) throw new Error("Set your mobile number first (phone mode) — or use 🎧 browser line");
+  const line = getTwilioLine();
+  const from = twilioNumberForLine(line);
+  if (!from) throw new Error("No Twilio number for this line — set TWILIO_AUSTRALIA_NUMBER or TWILIO_CANADA_NUMBER");
+  const blocked = leadFitsTwilioLine(lead, line);
+  if (blocked) throw new Error(blocked);
+  if (session.mode !== "rtc") {
+    const to = operatorTarget(session.mode);
+    if (!to) throw new Error("Set your mobile number first (phone mode) — or use 🎧 browser line");
+  }
 
   const callId = (db.prepare("INSERT INTO calls (lead_id, vonage_status) VALUES (?, 'started')").run(leadId)
     .lastInsertRowid) as number;
 
+  if (session.mode === "rtc") {
+    // The browser Device.connects. Inbound client:<identity> hits every tab, and any reject is busy.
+    ensurePoller();
+    publishCall();
+    return callId;
+  }
+
   try {
     const resp = await makeCall({
-      from: config.twilioNumber,
-      to,
-      twiml: dialTwiml(lead.phone_e164, callerIdForCountry(lead.country, null, "twilio")),
+      from,
+      to: operatorTarget(session.mode),
+      twiml: dialTwiml(lead.phone_e164, from),
       statusCallback: statusCallbackUrl(callId),
       timeout: 35,
     });
@@ -102,29 +179,18 @@ export async function dialLead(leadId: number): Promise<number> {
   return callId;
 }
 
-/** rtc: ring the browser client with a clip (cockpit measures it). phone: ring the mobile with it. */
-export async function runLineCheck(): Promise<{ ok: boolean; detail: string }> {
+/** phone: ring the mobile with a clip. rtc skips — an inbound ring to the browser is what marked the line busy. */
+export async function runLineCheck(): Promise<{ ok: boolean; detail: string; skipped?: boolean }> {
   const session = activeSession();
   if (!session || session.status !== "live") return { ok: false, detail: "no live session" };
+  if (session.mode === "rtc") return { ok: true, skipped: true, detail: "browser places the call" };
   if (activeCall()) return { ok: false, detail: "call in progress" };
   const to = operatorTarget(session.mode);
   if (!to) return { ok: false, detail: "no operator phone set" };
-  const resp = await makeCall({ from: config.twilioNumber, to, twiml: playTwiml(TWILIO_LINE_CHECK_CLIP), timeout: 15 });
-  if (session.mode !== "rtc") return { ok: true, detail: "ringing your mobile — answer to hear the test clip" };
-  // Hold the request open while the clip plays so the browser measures during it.
-  let info: TwilioCall | null = null;
-  let answered = false;
-  for (let i = 0; i < 14; i++) {
-    await new Promise((r) => setTimeout(r, 1000));
-    info = await getCall(resp.sid).catch(() => null);
-    if (info?.status === "in-progress") answered = true;
-    if (info && FINAL.has(info.status)) break;
-  }
-  if (info && !FINAL.has(info.status)) await hangupCall(resp.sid).catch(() => {});
-  answered ||= info?.status === "completed" && Number(info.duration) > 0;
-  return answered
-    ? { ok: true, detail: "Twilio → browser test leg answered" }
-    : { ok: false, detail: `browser never answered the Twilio test leg (status ${info?.status ?? "missing"}) — is the Device registered?` };
+  const from = twilioNumberForLine(getTwilioLine());
+  if (!from) return { ok: false, detail: "no Twilio number configured" };
+  await makeCall({ from, to, twiml: playTwiml(TWILIO_LINE_CHECK_CLIP), timeout: 15 });
+  return { ok: true, detail: "ringing your mobile — answer to hear the test clip" };
 }
 
 export async function sendDtmf(_digits: string): Promise<void> {

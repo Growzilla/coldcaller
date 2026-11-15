@@ -1,5 +1,7 @@
 import { config } from "./config";
-import { getDb, type Lead } from "./db";
+import { getDb, holdNonMobiles, type Lead } from "./db";
+import { staysOut } from "./lead-status";
+import { isDialableMobile, toE164 } from "./phone";
 import { getOperatorPhone } from "./provider";
 import { reviewDb } from "./review";
 
@@ -396,6 +398,8 @@ export type PullStats = {
   linked: number;
   requeued: number;
   noPhone: number;
+  /** Swedish and Australian landlines (and short invalid mobiles) left out of the queue. */
+  landline: number;
   /** Sole traders (nix-required) held out of the queue until NIX-washed. */
   nixHeld: number;
   /** Leads whose exact ICP score / website / city came back from the contact search. */
@@ -435,7 +439,7 @@ const REDIAL_AFTER_HOURS = 20;
  * Callback stage → priority 0 (top of queue). Leads already dialed recently are not re-queued.
  */
 export async function pullQueue(): Promise<PullStats> {
-  const stats: PullStats = { fetched: 0, inserted: 0, linked: 0, requeued: 0, noPhone: 0, nixHeld: 0, scored: 0 };
+  const stats: PullStats = { fetched: 0, inserted: 0, linked: 0, requeued: 0, noPhone: 0, landline: 0, nixHeld: 0, scored: 0 };
   if (!ghlEnabled()) throw new Error("GHL sync is off — set GHL_PRIVATE_TOKEN and GHL_LOCATION_ID in .env.local");
   const p = await getPipeline();
   const db = getDb();
@@ -452,6 +456,7 @@ export async function pullQueue(): Promise<PullStats> {
   const lastCall = db.prepare("SELECT MAX(started_at) t FROM calls WHERE lead_id=?");
   const requeue = db.prepare("UPDATE leads SET status='queued', priority=? WHERE id=?");
   const hold = db.prepare("UPDATE leads SET status='nix_hold' WHERE id=? AND status='queued'");
+  const holdLandline = db.prepare("UPDATE leads SET status='landline' WHERE id=? AND status='queued'");
   // Lead review (/review) judged it bad → out of the queue for good, not re-queued after 20 h.
   const holdBad = db.prepare("UPDATE leads SET status='review_bad' WHERE id=? AND status!='review_bad'");
 
@@ -482,9 +487,16 @@ export async function pullQueue(): Promise<PullStats> {
         stats.fetched++;
         const c = o.contact;
         const contactId = c?.id ?? o.contactId;
-        const phone = c?.phone?.trim() || null;
+        const phone = toE164(c?.phone);
         if (!contactId || !phone) {
           stats.noPhone++;
+          continue;
+        }
+        // Landlines are not loaded. An existing queued row is parked as `landline` so the next pull cannot put it back.
+        if (!isDialableMobile(phone)) {
+          stats.landline++;
+          const existing = (byContact.get(contactId) as Lead | undefined) ?? (byPhone.get(phone) as Lead | undefined);
+          if (existing) holdLandline.run(existing.id);
           continue;
         }
         const tags = c?.tags ?? [];
@@ -520,6 +532,9 @@ export async function pullQueue(): Promise<PullStats> {
           stats.inserted += res.changes;
           continue;
         }
+        // Cockpit "Not needed" (passed) and Skip (skipped) stay out. A pull must not undo that
+        // after the 20h redial window the way it does for no-answer.
+        if (staysOut(lead.status)) continue;
         setScore.run(tierScore(tags), lead.id);
         if (reviewBad) {
           holdBad.run(lead.id);
@@ -542,6 +557,8 @@ export async function pullQueue(): Promise<PullStats> {
       cursor = { startAfter: String(data.meta.startAfter ?? ""), startAfterId: data.meta.startAfterId };
     }
   }
+  // CSV landlines never appear in the GHL search above. Sweep them on every pull.
+  stats.landline += holdNonMobiles();
   try {
     stats.scored = await enrichScores();
   } catch (err) {

@@ -78,13 +78,18 @@ function importCallLog(file: string): { callbacks: number; skipped: number; note
     for (const e of entries) {
       const noteText = `[${logDate} · ${bucket}] ${e.notes.join(" | ")}`.trim();
       const existing = db
-        .prepare("SELECT id, prior_notes FROM leads WHERE lower(company)=lower(?) ORDER BY id LIMIT 1")
-        .get(e.company) as { id: number; prior_notes: string | null } | undefined;
+        .prepare("SELECT id, prior_notes, status FROM leads WHERE lower(company)=lower(?) ORDER BY id LIMIT 1")
+        .get(e.company) as { id: number; prior_notes: string | null; status: string } | undefined;
       // Idempotent: re-running the import never duplicates a note line.
       const mergedNotes = (prev: string | null) =>
         prev ? (prev.includes(noteText) ? prev : `${prev}\n${noteText}`) : noteText;
 
       if (existing) {
+        // "Not needed" in the cockpit is final. A call-log line may add a note, not put the lead back.
+        if (existing.status === "passed") {
+          db.prepare("UPDATE leads SET prior_notes=? WHERE id=?").run(mergedNotes(existing.prior_notes), existing.id);
+          continue;
+        }
         if (disp === "callback") {
           db.prepare("UPDATE leads SET priority=0, status='queued', prior_notes=? WHERE id=?")
             .run(mergedNotes(existing.prior_notes), existing.id);

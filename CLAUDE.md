@@ -198,10 +198,33 @@ creds 401 since 2026-10-07) and opens the cockpit at `?provider=46elks&source=gh
   dialing; the browser rejects a second auto-answer leg (486) and the leg of a dial hung up mid-flight.
 - **Hang up ends everything**: every open row's leg (server) + every browser SIP session / Twilio Call. Hang up
   during an in-flight dial closes the row; `dialLead` sees it on return and kills the new leg.
-- **Twilio** (`DIALER_PROVIDER=twilio` / provider dropdown / `COLDCALL_PROVIDER=twilio coldcall`): same bridge model
-  as 46elks — parent call rings `client:<TWILIO_CLIENT_IDENTITY>` (browser Device, auto-answered) or the operator
-  mobile (phone mode), inline TwiML `<Dial>`s the lead as the child leg. `lib/twilio.ts` (REST, hand-rolled HS256
-  access token with incoming-only grant — no TwiML App needed, X-Twilio-Signature check), `lib/twilio-dialer.ts`,
-  `/api/twilio/token`, `/api/twilio/status` (signed, public via middleware). Env in `.env.local`:
-  `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER`, and for the browser line
+- **Twilio** (`DIALER_PROVIDER=twilio` / provider dropdown / `COLDCALL_PROVIDER=twilio coldcall`): phone mode
+  still rings the operator mobile, then inline TwiML `<Dial>`s the lead. Browser (rtc) mode does **not**
+  `makeCall` `client:<identity>` — that invite hits every registered tab, and any `reject()` / `Device.destroy()`
+  is SIP 486 for the whole identity (calls 725–755, 2026-11-13, parent `busy` duration 0, no child). rtc dials
+  insert the row and the cockpit `Device.connect`s (outgoing grant + TwiML App `RapidDial browser`,
+  VoiceUrl `/api/twilio/client-voice`). That route reads the lead number from the `calls` row (`dbCallId`).
+  rtc line-check must not inbound-ring the client. `lib/twilio.ts`, `lib/twilio-dialer.ts`,
+  `/api/twilio/token`, `/api/twilio/client-voice`, `/api/twilio/status` (both signed, public via middleware).
+  Env in `.env.local`: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_NUMBER`, and for the browser line
   `TWILIO_API_KEY_SID` / `TWILIO_API_KEY_SECRET`. Not yet: inbound calls to the Twilio number, DTMF to the lead.
+
+## VPS deployment (2026-10-29) — the team dialer
+
+- **https://srv1954858.hstgr.cloud** — Caddy (Let's Encrypt) → basic auth (albert / darian / rehu, logins in
+  `~/dev/ops/dialer-vps/logins.txt`) → container `dialer-deploy-dialer-1`. Provider webhooks stay public (same
+  list as `middleware.ts`). Files: `~/dev/ops/dialer-vps/` (compose, Caddyfile template, `deploy.sh`).
+- **The VPS DB is now the source of truth** (`/opt/dialer/data/dialer.db`, migrated from local `data/dialer.db`
+  2026-10-29). Don't dial from the laptop's local DB any more, or history splits in two.
+- Redeploy after code changes: `bash ~/dev/ops/dialer-vps/deploy.sh` (rsyncs this working tree, rebuilds).
+- **Gotcha:** Docker drops env vars whose names start with a digit (`46ELKS_*`) from the container's main
+  process, and `npm`/`sh` drop them too. The env file is therefore ALSO mounted as `/app/.env.local` (config.ts
+  parses it) and Next starts via `node node_modules/next/dist/bin/next start`, never `npm start`.
+- 46elks `voice_start` (inbound) → `https://srv1954858.hstgr.cloud/api/elks/voice`; `ELKS_WEBHOOK_BASE` is set,
+  so no tunnel is needed. `sms_url` was left untouched.
+- **MCP (read-only)**: `app/api/mcp/[token]/route.ts`, public at `https://srv1954858.hstgr.cloud/mcp/<MCP_TOKEN>`
+  (full URL in logins.txt). Tools: objections_summary, best_to_call, followups_due, lead_lookup, call_stats,
+  recent_calls, queue_overview.
+- Lead batches: `se-electricians-v2-20261029` (filled hourly by VPS cron `/opt/leads-engine/el_v2_cron.sh`) and
+  `au-electricians-20261029` (500, priority 3, **DNCR wash pending**). `scripts/vps-site-check.ts` = site truth +
+  quality for a batch (modern sites are dropped as non-prospects).

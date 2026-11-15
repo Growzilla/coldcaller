@@ -1,22 +1,40 @@
 import { NextResponse } from "next/server";
-import { getDb, nextLead, queuePreview, queueCounts } from "@/lib/db";
+import { getDb, nextLead, queuePreview, queueCounts, takeLastWrapup } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-/** Undo the last wrapup: re-queue the most recently done/skipped lead and clear its last outcome. */
+/** Undo the last wrapup: re-queue that lead and clear its last outcome. */
 export async function POST(req: Request) {
   const db = getDb();
   const body = await req.json().catch(() => ({} as any));
   const country = body?.country ? String(body.country) : null;
   const source = body?.source ? String(body.source) : null;
-  const last = db
-    .prepare(
-      `SELECT l.id AS lead_id, c.id AS call_id FROM leads l
-       LEFT JOIN calls c ON c.id = (SELECT MAX(id) FROM calls WHERE lead_id = l.id AND outcome IS NOT NULL)
-       WHERE l.status IN ('done','skipped')
-       ORDER BY COALESCE(c.id, 0) DESC, l.id DESC LIMIT 1`
-    )
-    .get() as { lead_id: number; call_id: number | null } | undefined;
+
+  // Prefer the wrapup just saved. A "Not needed" pass has no call row, so call-id order would
+  // restore an older lead instead.
+  let last: { lead_id: number; call_id: number | null } | undefined;
+  const remembered = takeLastWrapup();
+  if (remembered) {
+    const lead = db.prepare("SELECT id, status FROM leads WHERE id=?").get(remembered) as
+      | { id: number; status: string }
+      | undefined;
+    if (lead && (lead.status === "passed" || lead.status === "done" || lead.status === "skipped")) {
+      const call = db
+        .prepare("SELECT id FROM calls WHERE lead_id=? AND outcome IS NOT NULL ORDER BY id DESC LIMIT 1")
+        .get(lead.id) as { id: number } | undefined;
+      last = { lead_id: lead.id, call_id: call?.id ?? null };
+    }
+  }
+  if (!last) {
+    last = db
+      .prepare(
+        `SELECT l.id AS lead_id, c.id AS call_id FROM leads l
+         LEFT JOIN calls c ON c.id = (SELECT MAX(id) FROM calls WHERE lead_id = l.id AND outcome IS NOT NULL)
+         WHERE l.status IN ('done','skipped','passed')
+         ORDER BY COALESCE(c.id, 0) DESC, l.id DESC LIMIT 1`
+      )
+      .get() as { lead_id: number; call_id: number | null } | undefined;
+  }
   if (!last) return NextResponse.json({ error: "Nothing to undo" }, { status: 400 });
 
   db.prepare("UPDATE leads SET status='queued' WHERE id=?").run(last.lead_id);

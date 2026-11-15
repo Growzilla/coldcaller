@@ -14,20 +14,16 @@ let chunks: Blob[] = [];
 
 export async function startCallRecording(): Promise<void> {
   if (recorder) return; // already rolling
-  // Reuse the SDK's outgoing mic track if present — opening a SECOND getUserMedia can starve the
-  // call's mic on some systems (outbound goes silent). Only open our own as a fallback.
+  // The call already holds the mic. Opening another getUserMedia here is a second
+  // echo-cancelled capture, and Chrome then silences the outbound audio.
   const sdkTrack = (window as any).__sdkMicTrack as MediaStreamTrack | undefined;
-  if (sdkTrack && sdkTrack.readyState === "live") {
-    micStream = new MediaStream([sdkTrack]);
-    ownsMic = false;
-  } else {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    ownsMic = true;
-  }
+  const liveMic = sdkTrack && sdkTrack.kind === "audio" && sdkTrack.readyState === "live" ? sdkTrack : undefined;
+  micStream = liveMic ? new MediaStream([liveMic]) : null;
+  ownsMic = false;
   ctx = new AudioContext();
   ctx.resume().catch(() => {});
   const mix = ctx.createMediaStreamDestination();
-  ctx.createMediaStreamSource(micStream).connect(mix);
+  if (micStream) ctx.createMediaStreamSource(micStream).connect(mix);
 
   // Remote (prospect) audio. Primary source: the raw WebRTC tracks stashed by the
   // RTCPeerConnection patch in page.tsx — immune to <audio> srcObject swaps that made

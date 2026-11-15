@@ -1,0 +1,10 @@
+node_modules
+.next
+data
+secrets
+.env
+.env.*
+!.env.example
+tunnel.env
+tunnel.token
+npm-debug.log

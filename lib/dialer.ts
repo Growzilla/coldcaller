@@ -2,6 +2,7 @@
  * Unified telephony facade — routes to Vonage or 46elks based on active provider.
  * API routes import from here so Vonage behaviour stays untouched when provider=vonage.
  */
+import { activeSession } from "./db";
 import { getDialerProvider, type DialerProvider } from "./provider";
 import { assertCallReady, config } from "./config";
 import { assertElksReady, getBalanceSek } from "./elks";
@@ -16,6 +17,8 @@ export {
   setDialerProvider,
   getCallerIdOverride,
   setCallerIdOverride,
+  getTwilioLine,
+  setTwilioLine,
   getOperatorPhone,
   setOperatorPhone,
   clearOperatorPhone,
@@ -34,7 +37,12 @@ export async function startSession(mode: "phone" | "rtc" = "phone") {
   return backend().startSession(mode);
 }
 
-export async function endSession() {
+export async function endSession(id?: number) {
+  // A stale end (reload reaper, a second tab) must not hang up a newer line.
+  if (id != null) {
+    const session = activeSession();
+    if (!session || session.id !== id) return;
+  }
   return backend().endSession();
 }
 

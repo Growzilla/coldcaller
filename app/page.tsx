@@ -2,11 +2,12 @@
 
 /**
  * RapidDial cockpit — single-screen power dialer.
- * Keyboard: P call · H hangup · 1–5 outcome · Enter save+next · S skip · O website · L LinkedIn
+ * Keyboard: P call · H hangup · 1–5 outcome · Enter save+next · S not needed (stays out) · D later (back in 24h) · O website · L LinkedIn
  * (modifier combos like Ctrl/Cmd+C are ignored so copy/paste never triggers a shortcut)
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { startCallRecording, stopCallRecording, recordingActive } from "@/lib/recorder";
+import { DEFAULT_TEMPLATES, fillTemplate, smsTarget, templateLang, type Lang, type Templates } from "@/lib/templates";
 
 type Lead = {
   id: number;
@@ -24,6 +25,11 @@ type Lead = {
   employees: string | null;
   priority: number;
   prior_notes: string | null;
+  maps_reason?: string | null;
+  gbp_status?: string | null;
+  /** "Perth 14:05" when the server knows the lead's zone. */
+  call_local?: string | null;
+  call_open?: boolean;
 };
 
 type InboundCaller = {
@@ -34,7 +40,7 @@ type InboundCaller = {
 
 type Session = { id: number; status: string; mode?: string } | null;
 type Call = { id: number; lead_id: number; vonage_status: string | null; ended_at: string | null; answered_at: string | null } | null;
-type Counts = { queued: number; done: number; callsToday: number };
+type Counts = { queued: number; done: number; callsToday: number; mapsOnly?: boolean; mapsHidden?: number; callWindow?: string };
 type SmsRow = {
   id: string;
   from_e164: string | null;
@@ -42,6 +48,9 @@ type SmsRow = {
   message: string | null;
   created_at: string | null;
   received_at: string;
+  lead_id?: number | null;
+  lead_company?: string | null;
+  lead_name?: string | null;
 };
 type VerifyRow = {
   id: string;
@@ -109,7 +118,7 @@ function ensureRemoteAudioPlayback() {
     });
     // expose the outgoing mic track so the recorder can reuse it instead of opening a 2nd mic
     const grabSent = () => {
-      const sender = pc.getSenders?.().find((s: any) => s.track && s.track.kind === "audio");
+      const sender = pc.getSenders?.().find((s: RTCRtpSender) => s.track && s.track.kind === "audio");
       if (sender?.track) w.__sdkMicTrack = sender.track;
       else w.__micMeterT = setTimeout(grabSent, 500);
     };
@@ -123,35 +132,66 @@ function ensureRemoteAudioPlayback() {
 
 /**
  * The Vonage SDK captures from the browser DEFAULT mic with no input-device API.
- * Patch getUserMedia so audio capture (the meter AND the SDK call) honors the mic chosen
- * in the cockpit (window.__micDeviceId). Idempotent.
+ * Patch getUserMedia so capture honors the chosen mic. Echo cancellation stays on.
+ * autoGainControl stays off: Chrome's AGC writes the headset volume, and PipeWire
+ * rejects that write so the mic stays at 100%. The level meter passes its own
+ * echoCancellation: false, which wins via `base`. Idempotent.
  */
+function logGum(ok: boolean, extra: { label?: string; name?: string; message?: string }) {
+  fetch("/api/client-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event: "gum", ok, ...extra }),
+  }).catch(() => {});
+}
+
 function applyMicConstraint() {
   const w = window as any;
   const md = navigator.mediaDevices;
-  if (w.__gumPatched || !md?.getUserMedia) return;
-  w.__gumPatched = true;
+  if (w.__gumPatched === 3 || !md?.getUserMedia) return;
+  w.__gumPatched = 3;
   const orig = md.getUserMedia.bind(md);
+  const withMic = (constraints: MediaStreamConstraints, exact: boolean): MediaStreamConstraints => {
+    if (!constraints.audio) return constraints;
+    const base = typeof constraints.audio === "object" ? constraints.audio : {};
+    const id = exact ? w.__micDeviceId : "";
+    return {
+      ...constraints,
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: false,
+        channelCount: 1,
+        ...base,
+        ...(id ? { deviceId: { exact: id } } : {}),
+      },
+    };
+  };
   md.getUserMedia = (constraints: MediaStreamConstraints = {}) => {
-    const id = w.__micDeviceId;
-    if (constraints.audio) {
-      const base = typeof constraints.audio === "object" ? constraints.audio : {};
-      // Ask for voice processing EXPLICITLY: `audio: true` leaves AEC to browser defaults, which
-      // Firefox/Waterfox drops for some devices (stereo USB mics like the Blue) → prospect hears
-      // themselves echo off our speakers. Mono also keeps the AEC path engaged.
-      constraints = {
-        ...constraints,
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          channelCount: 1,
-          ...base,
-          ...(id ? { deviceId: { exact: id } } : {}),
-        },
-      };
-    }
-    return orig(constraints);
+    const pinned = !!(constraints.audio && w.__micDeviceId);
+    return orig(withMic(constraints, true)).then(
+      (stream: MediaStream) => {
+        logGum(true, { label: stream.getAudioTracks()[0]?.label || "" });
+        return stream;
+      },
+      async (err: any) => {
+        logGum(false, { name: err?.name || "", message: err?.message || String(err) });
+        if (!pinned || !/Overconstrained|NotFound|NotReadable/i.test(err?.name || "")) throw err;
+        // Chrome device ids die when the headset reconnects. A dead exact id
+        // makes the call capture fail before Twilio is ever contacted.
+        w.__micDeviceId = "";
+        try { localStorage.removeItem("dialer-mic"); } catch {}
+        try { w.__onMicPinLost?.(); } catch {}
+        try {
+          const stream = await orig(withMic(constraints, false));
+          logGum(true, { label: stream.getAudioTracks()[0]?.label || "" });
+          return stream;
+        } catch (err2: any) {
+          logGum(false, { name: err2?.name || "", message: err2?.message || String(err2) });
+          throw err2;
+        }
+      }
+    );
   };
 }
 
@@ -160,6 +200,8 @@ export default function Cockpit() {
   const [callerId, setCallerId] = useState("");
   const [callerRegion, setCallerRegion] = useState<"US" | "SE">("SE");
   const [callerOverride, setCallerOverride] = useState<"US" | "SE" | null>(null);
+  const [twilioLine, setTwilioLine] = useState<"AU" | "CA">("AU");
+  const [twilioLines, setTwilioLines] = useState<{ line: "AU" | "CA"; country: string; number: string }[]>([]);
   const [balance, setBalance] = useState<number | null>(null);
   const [balanceCurrency, setBalanceCurrency] = useState("EUR");
   const [provider, setProvider] = useState<"vonage" | "46elks" | "twilio">("vonage");
@@ -180,6 +222,7 @@ export default function Cockpit() {
   const [countries, setCountries] = useState<{ country: string; n: number }[]>([]);
   const [source, setSource] = useState("");
   const [sources, setSources] = useState<{ source: string; n: number }[]>([]);
+  const [freshOnly, setFreshOnly] = useState(false); // "New leads only": already-dialed leads hidden
   const notesRef = useRef<HTMLTextAreaElement>(null);
   const leadRef = useRef<Lead | null>(null);
   leadRef.current = lead;
@@ -215,6 +258,13 @@ export default function Cockpit() {
   const [smsTo, setSmsTo] = useState("");
   const [smsBody, setSmsBody] = useState("");
   const [smsSending, setSmsSending] = useState(false);
+  /** Lead the SMS form was filled for (💬 Text pitch) — the send gets stamped on its notes. */
+  const [smsLeadId, setSmsLeadId] = useState<number | null>(null);
+  const smsBodyRef = useRef<HTMLInputElement>(null);
+  const [bookingUrl, setBookingUrl] = useState("");
+  // Standard SMS pitch + quick email (lib/templates.ts defaults, edits kept in this browser)
+  const [templates, setTemplates] = useState<Record<Lang, Templates>>(DEFAULT_TEMPLATES);
+  const [tplOpen, setTplOpen] = useState(false);
   const [intel, setIntel] = useState<{ company?: string; analysis: any } | null>(null);
   const [inbound, setInbound] = useState<InboundCaller | null>(null);
   // Solid-state line: verified-audio status, media liveness, reload-orphan handling
@@ -225,18 +275,28 @@ export default function Cockpit() {
     send?: boolean;
     sentKb?: number;
   }>(null);
+  const lineCheckRunningRef = useRef(false);
+  lineCheckRunningRef.current = !!lineCheck?.running;
   const [connDead, setConnDead] = useState(false);
-  const startInFlightRef = useRef(false); // startLineRtc in progress — don't reap its session
+  const startInFlightRef = useRef(false); // one Start line at a time — a second click must not open or end a session
+  const [lineStarting, setLineStarting] = useState(false);
   const checkedSessionRef = useRef<number | null>(null); // auto line-check ran for this session
   // WebRTC audio diagnostics (browser line)
   const [micLevel, setMicLevel] = useState(0);
   const [rtcDiag, setRtcDiag] = useState<string>("");
   const [micDevices, setMicDevices] = useState<{ deviceId: string; label: string }[]>([]);
   const [micDeviceId, setMicDeviceId] = useState<string>("");
-  const [micActive, setMicActive] = useState(false); // meter running standalone (no live call)
+  const [micActive, setMicActive] = useState(false); // meter running on the selected input
+  const [micCaptureLabel, setMicCaptureLabel] = useState("");
   const [outputDevices, setOutputDevices] = useState<{ deviceId: string; label: string }[]>([]);
   const [outputDeviceId, setOutputDeviceId] = useState<string>(""); // chosen speaker (setSinkId)
-  const diagRef = useRef<{ raf?: number; poll?: ReturnType<typeof setInterval>; micPoll?: ReturnType<typeof setInterval>; ac?: AudioContext; mic?: MediaStream }>({});
+  const diagRef = useRef<{
+    raf?: number;
+    poll?: ReturnType<typeof setInterval>;
+    micPoll?: ReturnType<typeof setInterval>;
+    ac?: AudioContext;
+    mic?: MediaStream;
+  }>({});
   const flash = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 5000);
@@ -244,8 +304,14 @@ export default function Cockpit() {
 
   // P pressed, /api/call not back yet (makeCall takes seconds): already "in a call" for P/H/buttons.
   const [dialing, setDialing] = useState(false);
+  // Company of a ringing call Enter/S hung up while moving on — shown next to Hang up until it ends.
+  const [carriedCompany, setCarriedCompany] = useState<string | null>(null);
   const callActive = (!!call && !call.ended_at) || dialing;
+  const callIdRef = useRef<number | null>(null);
+  callIdRef.current = call?.id ?? null;
   const callStatus = call?.vonage_status ?? null;
+  const callStatusRef = useRef<string | null>(null);
+  callStatusRef.current = callStatus;
   const prevCallStatusRef = useRef<string | null>(null);
   const callActiveRef = useRef(false);
   callActiveRef.current = callActive;
@@ -267,10 +333,11 @@ export default function Cockpit() {
       const d = await fetch("/api/elks/sms/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to, message }),
+        body: JSON.stringify({ to, message, leadId: smsLeadId ?? undefined }),
       }).then((r) => r.json());
       if (d.error) throw new Error(d.error);
       setSmsBody("");
+      setSmsLeadId(null);
       flash(`💬 Sent to ${d.to}${d.costSek != null ? ` · ${d.costSek.toFixed(2)} SEK` : ""}`);
       refreshSmsInbox();
     } catch (e: any) {
@@ -278,7 +345,7 @@ export default function Cockpit() {
     } finally {
       setSmsSending(false);
     }
-  }, [smsTo, smsBody, flash, refreshSmsInbox]);
+  }, [smsTo, smsBody, smsLeadId, flash, refreshSmsInbox]);
 
   const refreshVerifyInbox = useCallback(async () => {
     const d = await fetch("/api/elks/verify/inbox").then((r) => r.json()).catch(() => null);
@@ -324,6 +391,8 @@ export default function Cockpit() {
     setCallerId(s.callerId);
     setCallerRegion(s.callerRegion ?? "SE");
     setCallerOverride(s.callerOverride ?? null);
+    if (s.twilioLine === "AU" || s.twilioLine === "CA") setTwilioLine(s.twilioLine);
+    setTwilioLines(Array.isArray(s.twilioLines) ? s.twilioLines : []);
     setBalance(s.balance);
     setBalanceCurrency(s.balanceCurrency ?? "EUR");
     setProvider(s.provider ?? "vonage");
@@ -336,21 +405,25 @@ export default function Cockpit() {
     setCounts(s.counts);
     setCountries(s.countries ?? []);
     setSources(s.sources ?? []);
+    if (s.bookingUrl) setBookingUrl(s.bookingUrl);
+    setFreshOnly(Boolean(s.freshOnly));
   }, []);
 
   useEffect(() => {
-    const saved = localStorage.getItem("dialer-region") ?? "";
+    const qs = new URLSearchParams(window.location.search);
+    // `coldcall` passes ?country= so the boot choice beats a stale saved filter.
+    const saved = qs.has("country") ? qs.get("country") || "" : (localStorage.getItem("dialer-region") ?? "");
+    if (qs.has("country")) localStorage.setItem("dialer-region", saved);
     regionRef.current = saved;
     setRegion(saved);
     // `coldcall` opens ?source=ghl so the GHL queue (best ICP first) is what you dial.
-    const qsSource = new URLSearchParams(window.location.search).get("source");
+    const qsSource = qs.get("source");
     if (qsSource !== null) localStorage.setItem("dialer-source", qsSource);
     const savedSource = localStorage.getItem("dialer-source") ?? "";
     sourceRef.current = savedSource;
     setSource(savedSource);
     const savedProvider = localStorage.getItem("dialer-provider");
     const savedOperator = localStorage.getItem("dialer-operator-phone");
-    const qs = new URLSearchParams(window.location.search);
     const smsMode = qs.get("sms") === "1";
     const verifyQ = qs.get("verify");
     const boot = async () => {
@@ -386,6 +459,14 @@ export default function Cockpit() {
           body: JSON.stringify({ provider: savedProvider }),
         });
       }
+      const live = await fetch("/api/provider").then((r) => r.json()).catch(() => null);
+      if (live?.provider === "twilio") {
+        const lineRes = await fetch("/api/twilio/line").then((r) => r.json()).catch(() => null);
+        const country = lineRes?.line === "CA" ? "Canada" : "Australia";
+        regionRef.current = country;
+        setRegion(country);
+        localStorage.setItem("dialer-region", country);
+      }
       if (savedOperator) {
         await fetch("/api/operator-phone", {
           method: "POST",
@@ -404,6 +485,7 @@ export default function Cockpit() {
   // Audio devices: patch getUserMedia, restore saved mic + speaker, list in/out (refresh on hot-plug)
   useEffect(() => {
     applyMicConstraint();
+    (window as any).__onMicPinLost = () => setMicDeviceId("");
     const saved = localStorage.getItem("dialer-mic") ?? "";
     if (saved) {
       setMicDeviceId(saved);
@@ -428,17 +510,58 @@ export default function Cockpit() {
         .catch(() => {});
     load();
     navigator.mediaDevices?.addEventListener?.("devicechange", load);
-    return () => navigator.mediaDevices?.removeEventListener?.("devicechange", load);
+    return () => {
+      (window as any).__onMicPinLost = undefined;
+      navigator.mediaDevices?.removeEventListener?.("devicechange", load);
+    };
   }, []);
+
+  const switchTwilioLine = useCallback(
+    async (line: "AU" | "CA") => {
+      if (line === twilioLine) return;
+      if (callActiveRef.current) {
+        flash("Hang up before switching country");
+        return;
+      }
+      const res = await fetch("/api/twilio/line", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ line }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        flash(data.error || "Could not switch Twilio number");
+        return;
+      }
+      const country = line === "AU" ? "Australia" : "Canada";
+      regionRef.current = country;
+      setRegion(country);
+      localStorage.setItem("dialer-region", country);
+      setTwilioLine(line);
+      await refresh();
+      flash(line === "AU" ? `🇦🇺 Australia leads from ${data.number}` : `🇨🇦 Canada leads from ${data.number}`);
+    },
+    [flash, refresh, twilioLine]
+  );
 
   const changeRegion = useCallback(
     (r: string) => {
+      if (provider === "twilio" && (r === "Australia" || r === "Canada")) {
+        const line = r === "Australia" ? "AU" : "CA";
+        if (line !== twilioLine) {
+          switchTwilioLine(line);
+          return;
+        }
+      }
       regionRef.current = r;
       setRegion(r);
       localStorage.setItem("dialer-region", r);
+      if (provider === "twilio" && r && r !== "Australia" && r !== "Canada") {
+        flash("This Twilio number only dials Australia or Canada. Pick 🇦🇺 or 🇨🇦.");
+      }
       refresh();
     },
-    [refresh]
+    [refresh, provider, twilioLine, switchTwilioLine, flash]
   );
 
   const changeSource = useCallback(
@@ -527,19 +650,55 @@ export default function Cockpit() {
     return () => es.close();
   }, [flash]);
 
-  // Reload-orphan reaper. An rtc session's audio lives in THIS page's WebRTC connection —
-  // a reload destroys the media but leaves the DB session "live" and a zombie leg at Vonage
-  // (exactly the 2026-06-12 dead-air incident: cockpit said Line live, room had no browser).
-  // An active rtc session observed RIGHT AFTER page load that this page doesn't own is a
-  // corpse from the previous load: end it. Only within 15s of mount — a session appearing
-  // later belongs to another context (test harness, second tab) and must be left alone.
-  const mountedAtRef = useRef(Date.now());
+  // Fallback to the SSE push: poll session + call while a line or call is up. A stalled event stream
+  // (too many cockpit tabs) left the page blind to a live line and hid Hang up (2026-10-19).
+  const pollLive = sessionLive || callActive || dialing;
   useEffect(() => {
-    if (Date.now() - mountedAtRef.current > 15_000) return;
+    if (!pollLive) return;
+    let last = "";
+    const iv = setInterval(() => {
+      const cid = callIdRef.current;
+      fetch(`/api/live${cid ? `?callId=${cid}` : ""}`)
+        .then((r) => r.json())
+        .then((d) => {
+          const key = JSON.stringify(d);
+          if (key === last) return;
+          last = key;
+          setSession((prev) => (JSON.stringify(prev) === JSON.stringify(d.session) ? prev : d.session));
+          // never blank the call the wrapup is about — only adopt a newer/updated row
+          if (d.call) setCall((prev) => (JSON.stringify(prev) === JSON.stringify(d.call) ? prev : d.call));
+        })
+        .catch(() => {});
+    }, 3000);
+    return () => clearInterval(iv);
+  }, [pollLive]);
+
+  // Saved template edits (✎ Templates) — per browser, defaults in lib/templates.ts
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("dialer-templates") || "null");
+      if (saved?.en && saved?.sv) setTemplates({ en: { ...DEFAULT_TEMPLATES.en, ...saved.en }, sv: { ...DEFAULT_TEMPLATES.sv, ...saved.sv } });
+    } catch {}
+  }, []);
+
+  // Reload-orphan reaper. A reload destroys the browser audio but leaves the DB session
+  // "live". Only a session that was already live when THIS page opened, and that this
+  // page does not own, is that corpse. A line started after the page opened stays up.
+  const pageLoadedAt = useRef(Date.now());
+  const reapedSessionId = useRef<number | null>(null);
+  useEffect(() => {
     if (!session || session.mode !== "rtc") return;
     if (session.status !== "starting" && session.status !== "live") return;
-    if (rtcRef.current.client || startInFlightRef.current) return;
-    fetch("/api/session/end", { method: "POST" })
+    if (rtcRef.current.client || twilioRef.current.device || elksRtcRef.current.ua || startInFlightRef.current) return;
+    const started = session.started_at ? Date.parse(String(session.started_at).replace(" ", "T") + "Z") : 0;
+    if (!started || started >= pageLoadedAt.current - 2_000) return;
+    if (reapedSessionId.current === session.id) return;
+    reapedSessionId.current = session.id;
+    fetch("/api/session/end", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: session.id }),
+    })
       .then(() => {
         flash("♻️ Found a stale browser line from before a reload — ended it. Hit 🎧 Start line.");
         refresh();
@@ -640,20 +799,28 @@ export default function Cockpit() {
   }, [operatorPhoneDraft, session, flash, refresh]);
 
   const startLine = useCallback(async () => {
-    if (provider === "46elks") {
-      const raw = operatorPhoneDraft.trim();
-      if (!raw) {
-        flash("Enter your Swedish mobile (+46… or 07x…) first — or use 🎧 browser line");
-        return;
+    if (startInFlightRef.current) return;
+    startInFlightRef.current = true;
+    setLineStarting(true);
+    try {
+      if (provider === "46elks") {
+        const raw = operatorPhoneDraft.trim();
+        if (!raw) {
+          flash("Enter your Swedish mobile (+46… or 07x…) first — or use 🎧 browser line");
+          return;
+        }
+        if (raw !== operatorPhone) await saveOperatorPhone();
+        const phone = operatorPhone || raw;
+        if (!phone.startsWith("+46")) {
+          flash("46elks phone mode needs a Swedish mobile — or use 🎧 browser line");
+          return;
+        }
       }
-      if (raw !== operatorPhone) await saveOperatorPhone();
-      const phone = operatorPhone || raw;
-      if (!phone.startsWith("+46")) {
-        flash("46elks phone mode needs a Swedish mobile — or use 🎧 browser line");
-        return;
-      }
+      await api("/api/session/start", { mode: "phone" }).catch(() => {});
+    } finally {
+      startInFlightRef.current = false;
+      setLineStarting(false);
     }
-    await api("/api/session/start", { mode: "phone" }).catch(() => {});
   }, [api, provider, operatorPhoneDraft, operatorPhone, saveOperatorPhone, flash]);
 
   const switchProvider = useCallback(
@@ -668,9 +835,20 @@ export default function Cockpit() {
         body: JSON.stringify({ provider: next }),
       });
       localStorage.setItem("dialer-provider", next);
+      if (next === "twilio") {
+        const lineRes = await fetch("/api/twilio/line").then((r) => r.json()).catch(() => null);
+        const country = lineRes?.line === "CA" ? "Canada" : "Australia";
+        regionRef.current = country;
+        setRegion(country);
+        localStorage.setItem("dialer-region", country);
+      }
       await refresh();
       flash(
-        next === "46elks" ? "🇸🇪 46elks — calls from +46766861525" : next === "twilio" ? "Twilio provider active" : "Vonage provider active"
+        next === "46elks"
+          ? "🇸🇪 46elks — calls from +46766861525"
+          : next === "twilio"
+            ? "Twilio — 🇦🇺 Australia or 🇨🇦 Canada in the header"
+            : "Vonage provider active"
       );
     },
     [session, flash, refresh]
@@ -690,10 +868,12 @@ export default function Cockpit() {
     if (w.__micMeterT) clearTimeout(w.__micMeterT);
     w.__rtcRemoteTracks = []; // dead session's tracks — recorder filters non-live anyway
     w.__rtcPcs = [];
+    w.__sdkMicTrack = undefined;
     w.__rtcConnState = undefined;
     w.__localMicLevel = 0;
     setMicLevel(0);
     setMicActive(false);
+    setMicCaptureLabel("");
     setRtcDiag("");
     setConnDead(false);
     setLineCheck(null);
@@ -702,26 +882,28 @@ export default function Cockpit() {
     if (a) { try { (a.srcObject as MediaStream | null)?.getTracks().forEach((t) => t.stop()); } catch {} a.remove(); }
   }, []);
 
-  /** Live mic level meter (own getUserMedia — fine on PipeWire/PulseAudio; multiple readers don't conflict). */
+  /** Level meter. Raw capture, so the call keeps the mic's one echo-cancelled stream. */
   const startMicMeter = useCallback(async (): Promise<boolean> => {
     if (diagRef.current.raf) cancelAnimationFrame(diagRef.current.raf);
     diagRef.current.ac?.close().catch(() => {});
     diagRef.current.mic?.getTracks().forEach((t) => t.stop());
+    const rawMic = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
     try {
       applyMicConstraint();
       let mic: MediaStream;
       try {
-        mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mic = await navigator.mediaDevices.getUserMedia({ audio: rawMic });
       } catch (err: any) {
         // A pinned mic (window.__micDeviceId) can go stale (reconnect / browser restart
         // rotates the deviceId) → exact-constraint throws. Fall back to the default mic.
         if ((window as any).__micDeviceId && /Overconstrained|NotFound|NotReadable/i.test(err?.name || "")) {
           (window as any).__micDeviceId = "";
           setMicDeviceId("");
-          mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mic = await navigator.mediaDevices.getUserMedia({ audio: rawMic });
           setRtcDiag("🎤 chosen mic unavailable — using system default");
         } else throw err;
       }
+      setMicCaptureLabel(mic.getAudioTracks()[0]?.label || "Default mic");
       navigator.mediaDevices
         ?.enumerateDevices?.()
         .then((ds) => setMicDevices(ds.filter((d) => d.kind === "audioinput").map((d) => ({ deviceId: d.deviceId, label: d.label || `Microphone ${d.deviceId.slice(0, 4)}` }))))
@@ -746,12 +928,13 @@ export default function Cockpit() {
       return true;
     } catch (e: any) {
       setMicActive(false);
+      setMicCaptureLabel("");
       setRtcDiag(`🎤 MIC BLOCKED (${e?.name || e}) — click the address-bar 🎙 icon → Allow, then End + Start line.`);
       return false;
     }
   }, []);
 
-  /** Pick the mic for the meter + call. Live-restart the meter; End + Start to apply to a live call. */
+  /** Pick the mic. The green bar follows at once. End + Start line to switch a live call. */
   const selectMic = useCallback((id: string) => {
     setMicDeviceId(id);
     localStorage.setItem("dialer-mic", id);
@@ -795,20 +978,17 @@ export default function Cockpit() {
     }
   }, [outputDeviceId, outputDevices, flash]);
 
-  // Auto-connect the mic meter on the first user gesture. getUserMedia is silent once
-  // permission is granted, and AudioContext only produces data after a gesture — so this
-  // lights up the meter automatically as soon as you touch the page, no need to start the
-  // call line first. Fires once; the call line re-uses the same meter if already running.
+  // Meter the chosen mic as soon as the page can, and again on the first click if the
+  // audio context was still suspended.
   useEffect(() => {
     const arm = () => {
-      if (!diagRef.current.raf && !diagRef.current.mic) startMicMeter();
+      const ac = diagRef.current.ac;
+      if (ac?.state === "suspended") void ac.resume();
+      if (!diagRef.current.mic) void startMicMeter();
     };
-    window.addEventListener("pointerdown", arm, { once: true });
-    window.addEventListener("keydown", arm, { once: true });
-    return () => {
-      window.removeEventListener("pointerdown", arm);
-      window.removeEventListener("keydown", arm);
-    };
+    window.addEventListener("pointerdown", arm);
+    void startMicMeter();
+    return () => window.removeEventListener("pointerdown", arm);
   }, [startMicMeter]);
 
   /** Watch the SDK's remote <audio> element; defensively un-mute + play it (fixes autoplay-blocked inbound). */
@@ -858,7 +1038,6 @@ export default function Cockpit() {
   /** Browser line: mic + speakers instead of your phone. Line cost: €0. */
   const startLineRtc = useCallback(async () => {
     setError(null);
-    startInFlightRef.current = true; // shields the new session from the orphan reaper
     ensureRemoteAudioPlayback(); // pipe inbound audio to a real <audio> element BEFORE the SDK builds its PC
     await startMicMeter(); // permission prompt + live mic meter
     try {
@@ -883,8 +1062,6 @@ export default function Cockpit() {
       setError(`Browser line failed: ${e?.message || e}. Is the tunnel running? (npm run tunnel)`);
       stopDiag();
       fetch("/api/session/end", { method: "POST" }).catch(() => {});
-    } finally {
-      startInFlightRef.current = false;
     }
   }, [api, startMicMeter, pollRemoteAudio, stopDiag]);
 
@@ -948,7 +1125,6 @@ export default function Cockpit() {
   /** 46elks browser line — JsSIP WebRTC to +46766861525, no personal phone needed. */
   const startLineElksRtc = useCallback(async () => {
     setError(null);
-    startInFlightRef.current = true;
     ensureRemoteAudioPlayback();
     await startMicMeter();
     try {
@@ -983,6 +1159,8 @@ export default function Cockpit() {
       });
       ua.on("newRTCSession", (e: any) => {
         const sess = e.session;
+        // Finished sessions whose ended/failed event never fired must not count as "a call is up".
+        for (const s of elksSessionsRef.current) if (s.isEnded?.()) elksSessionsRef.current.delete(s);
         // One call at a time: a second auto-answer leg while one is up is a duplicate dial — reject it.
         // Same for the leg of a dial the operator already hung up on while it was being placed.
         if (e.originator === "remote" && (elksSessionsRef.current.size > 0 || cancelledDialRef.current)) {
@@ -1047,6 +1225,10 @@ export default function Cockpit() {
         }
       });
       elksRtcRef.current.ua = ua;
+      // Pull the live session now instead of waiting on the SSE push: a stalled event stream
+      // left the button on "Start line" while the server line was up (2026-10-19). The UA is set
+      // first so the auto line-check (keyed on session) sees it.
+      await refresh();
       setConnDead(false);
       pollRemoteAudio();
       flash(`🇸🇪 46elks browser line live — calling from ${creds.number}`);
@@ -1058,31 +1240,46 @@ export default function Cockpit() {
       } catch {}
       elksRtcRef.current = { ua: null, session: null };
       fetch("/api/session/end", { method: "POST" }).catch(() => {});
-    } finally {
-      startInFlightRef.current = false;
     }
-  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash]);
+  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash, refresh]);
 
-  /** Twilio browser line — Voice SDK Device; each dial rings `client:<identity>`, auto-answered here. */
+  /** Twilio browser line. Dials leave via Device.connect — an inbound client invite is what came back busy. */
   const startLineTwilioRtc = useCallback(async () => {
     setError(null);
-    startInFlightRef.current = true;
     ensureRemoteAudioPlayback(); // patch RTCPeerConnection BEFORE the SDK builds one
     await startMicMeter();
     try {
-      const t = await fetch("/api/twilio/token").then((r) => r.json());
+      const t = await fetch("/api/twilio/token?rotate=1").then((r) => r.json());
       if (t.error || !t.token) throw new Error(t.error || "Could not get Twilio token");
       const { Device } = await import("@twilio/voice-sdk");
+      const leaked = (window as any).__rapiddialTwilio;
+      if (leaked && leaked !== twilioRef.current.device) {
+        try { leaked.destroy(); } catch {}
+      }
       const device = new Device(t.token, { codecPreferences: ["opus", "pcmu"] as any, closeProtection: true });
+      (window as any).__rapiddialTwilio = device;
       const calls = twilioRef.current.calls;
       device.on("incoming", (c: any) => {
-        // Every leg is ours (server-originated). One call at a time: reject a duplicate, and the leg
-        // of a dial already hung up on; anything not expected is stale → reject too.
-        if (calls.size > 0 || cancelledDialRef.current || Date.now() >= expectOutboundUntilRef.current) {
-          cancelledDialRef.current = false;
+        for (const prev of [...calls]) {
           try {
-            c.reject();
-          } catch {}
+            const st = typeof prev.status === "function" ? prev.status() : "";
+            if (st === "closed") calls.delete(prev);
+          } catch {
+            calls.delete(prev);
+          }
+        }
+        // Never c.reject() here. Twilio treats that as "client busy" for the whole
+        // identity, so a second RapidDial tab (or a leftover Device) cancels the dial
+        // before this tab can answer. Ignore a leg we did not just place.
+        const expecting = !cancelledDialRef.current && Date.now() < expectOutboundUntilRef.current;
+        const reason = !expecting ? "not-expecting" : calls.size > 0 ? "already-in-call" : "accept";
+        fetch("/api/client-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ event: "twilio-incoming", reason, calls: calls.size }),
+        }).catch(() => {});
+        if (reason !== "accept") {
+          cancelledDialRef.current = false;
           return;
         }
         expectOutboundUntilRef.current = 0;
@@ -1105,6 +1302,7 @@ export default function Cockpit() {
         await fetch("/api/session/end", { method: "POST" });
         await api("/api/session/start", { mode: "rtc" });
       }
+      await refresh(); // same as 46elks: don't depend on the SSE push for the live session
       setConnDead(false);
       pollRemoteAudio();
       flash(`Twilio browser line live — calling from ${t.number}`);
@@ -1116,29 +1314,48 @@ export default function Cockpit() {
       } catch {}
       twilioRef.current = { device: null, calls: new Set() };
       fetch("/api/session/end", { method: "POST" }).catch(() => {});
-    } finally {
-      startInFlightRef.current = false;
     }
-  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash]);
+  }, [api, startMicMeter, pollRemoteAudio, stopDiag, flash, refresh]);
 
   const startBrowserLine = useCallback(async () => {
-    if (session) await fetch("/api/session/end", { method: "POST" });
-    // Server is authoritative: a click before the boot's provider switch lands would otherwise
-    // take the Vonage path with stale React state.
-    const live = await fetch("/api/provider")
-      .then((r) => r.json())
-      .then((d) => d.provider as string)
-      .catch(() => provider);
-    if (live === "46elks") {
-      await startLineElksRtc();
-      return;
+    // Synchronous: a second click during mic permission / register / session start
+    // used to open another session, get "already active", and end the line that just came up.
+    if (startInFlightRef.current) return;
+    startInFlightRef.current = true;
+    setLineStarting(true);
+    setError(null);
+    try {
+      // A previous start can leave a Device after the session row was ended.
+      // Drop it so this click registers one line instead of no-op'ing.
+      const oldTwilio = twilioRef.current.device;
+      if (oldTwilio) {
+        try { oldTwilio.destroy(); } catch {}
+        twilioRef.current = { device: null, calls: new Set() };
+      }
+      const oldUa = elksRtcRef.current.ua;
+      if (oldUa) {
+        try { oldUa.stop(); } catch {}
+        elksRtcRef.current = { ua: null, session: null };
+      }
+      const oldClient = rtcRef.current.client;
+      if (oldClient) {
+        try { oldClient.deleteSession(); } catch {}
+        rtcRef.current = { client: null, callId: null };
+      }
+      // Server is authoritative: a click before the boot's provider switch lands would otherwise
+      // take the Vonage path with stale React state.
+      const live = await fetch("/api/provider")
+        .then((r) => r.json())
+        .then((d) => d.provider as string)
+        .catch(() => provider);
+      if (live === "46elks") await startLineElksRtc();
+      else if (live === "twilio") await startLineTwilioRtc();
+      else await startLineRtc();
+    } finally {
+      startInFlightRef.current = false;
+      setLineStarting(false);
     }
-    if (live === "twilio") {
-      await startLineTwilioRtc();
-      return;
-    }
-    await startLineRtc();
-  }, [provider, session, startLineRtc, startLineElksRtc, startLineTwilioRtc]);
+  }, [provider, startLineRtc, startLineElksRtc, startLineTwilioRtc]);
 
   const endLine = useCallback(async () => {
     stopDiag();
@@ -1164,11 +1381,13 @@ export default function Cockpit() {
       } catch {}
       elksRtcRef.current = { ua: null, session: null };
     }
-    if (twilioRef.current.device) {
+    const twilioDevice = twilioRef.current.device || (window as any).__rapiddialTwilio;
+    if (twilioDevice) {
       try {
-        twilioRef.current.device.disconnectAll();
-        twilioRef.current.device.destroy();
+        twilioDevice.disconnectAll();
+        twilioDevice.destroy();
       } catch {}
+      (window as any).__rapiddialTwilio = null;
       twilioRef.current = { device: null, calls: new Set() };
     }
     api("/api/session/end").then(refresh).catch(() => {});
@@ -1236,6 +1455,12 @@ export default function Cockpit() {
       const sentBefore = await senderBytes();
       expectOutboundUntilRef.current = Date.now() + 20_000; // the check arrives as an incoming leg
       const res = await fetch("/api/line-check", { method: "POST" }).then((r) => r.json()); // ~10s: leg joins + speaks
+      if (res.skipped) {
+        stopMeter();
+        setLineCheck(null);
+        flash("Browser line is up. Call your phone to confirm both sides can hear.");
+        return;
+      }
       // Max seen DURING the check: a 46elks test leg hangs up when its clip ends, taking its pc with it.
       const sentAfter = Math.max(await senderBytes(), sentMax);
       stopMeter();
@@ -1275,9 +1500,84 @@ export default function Cockpit() {
   );
 
   const dialingRef = useRef(false);
+
+  /** Place the Twilio parent from this tab only. Other tabs never see the invite, so they cannot 486 it. */
+  const originateTwilio = useCallback(async (callId: number) => {
+    const log = (ok: boolean, message?: string) =>
+      fetch("/api/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "twilio-connect", callId, ok, message }),
+      }).catch(() => {});
+    const fail = async (message: string) => {
+      log(false, message);
+      await fetch("/api/hangup", { method: "POST" }).catch(() => {});
+      throw new Error(message);
+    };
+    const device = twilioRef.current.device;
+    if (!device) return fail("Browser line is not registered — End line, then Start line");
+    log(true, `state:${device.state || "unknown"}`);
+    if (cancelledDialRef.current) {
+      await fetch("/api/hangup", { method: "POST" }).catch(() => {});
+      return;
+    }
+    const params = { dbCallId: String(callId) };
+    let conn: any;
+    try {
+      conn = await device.connect({ params });
+    } catch (e: any) {
+      const message = e?.message || "Browser could not place the call";
+      if (!/already active/i.test(String(message))) return fail(message);
+      try { device.disconnectAll(); } catch {}
+      try {
+        conn = await device.connect({ params });
+      } catch (e2: any) {
+        return fail(e2?.message || message);
+      }
+    }
+    if (cancelledDialRef.current) {
+      try { conn.disconnect(); } catch {}
+      await fetch("/api/hangup", { method: "POST" }).catch(() => {});
+      return;
+    }
+    twilioRef.current.calls.add(conn);
+    const drop = () => twilioRef.current.calls.delete(conn);
+    for (const ev of ["disconnect", "cancel", "reject", "error"]) conn.on(ev, drop);
+    conn.on("error", (e: any) => {
+      const message = `${e?.code ? e.code + " " : ""}${e?.message || e}`;
+      log(false, message);
+      setError(`Twilio: ${message}`);
+      fetch("/api/hangup", { method: "POST" }).catch(() => {});
+    });
+    for (const ev of ["ringing", "accept", "disconnect", "cancel"]) {
+      conn.on(ev, () => log(true, ev));
+    }
+  }, []);
+  /**
+   * P only fires with no call active, so any 46elks SIP session the browser still holds is a
+   * leftover (missed BYE, call ended on the server). Left alone it makes the browser reject the
+   * new dial's leg as a duplicate (486 → "busy", calls 388–390). Spare a running audio check.
+   */
+  const clearLeftoverElksSessions = useCallback(() => {
+    if (lineCheckRunningRef.current) return;
+    for (const s of elksSessionsRef.current) {
+      if (s === ringSessRef.current) continue; // a real inbound caller still ringing — not ours to drop
+      try {
+        if (!s.isEnded?.()) s.terminate();
+      } catch {}
+      elksSessionsRef.current.delete(s);
+    }
+    elksRtcRef.current.session = null;
+  }, []);
+
   const dial = useCallback(() => {
     const l = leadRef.current;
     if (!l || dialingRef.current || callActiveRef.current) return; // never two calls at once
+    clearLeftoverElksSessions();
+    for (const c of twilioRef.current.calls) {
+      try { c.disconnect(); } catch {}
+    }
+    twilioRef.current.calls.clear();
     dialingRef.current = true;
     cancelledDialRef.current = false;
     setDialing(true);
@@ -1285,19 +1585,31 @@ export default function Cockpit() {
     setNotes("");
     setDtmfSent("");
     api("/api/call", { leadId: l.id })
+      .then(async (d) => {
+        if (d.originate && d.callId) await originateTwilio(d.callId);
+      })
       .catch(() => {})
       .finally(() => {
         dialingRef.current = false;
         setDialing(false);
       });
-  }, [api]);
+  }, [api, clearLeftoverElksSessions, originateTwilio]);
 
   // Ad-hoc dial: any number, queue or not. Server creates/reuses a minimal lead row so
   // wrapup, recording, and intel all work; the card swaps to it like the inbound path does.
   const [manualNumber, setManualNumber] = useState("");
+  useEffect(() => {
+    const dialQ = new URLSearchParams(window.location.search).get("dial");
+    if (dialQ) setManualNumber(dialQ);
+  }, []);
   const manualDial = useCallback(() => {
     const n = manualNumber.trim();
     if (!n || dialingRef.current || callActiveRef.current) return;
+    clearLeftoverElksSessions();
+    for (const c of twilioRef.current.calls) {
+      try { c.disconnect(); } catch {}
+    }
+    twilioRef.current.calls.clear();
     dialingRef.current = true;
     cancelledDialRef.current = false;
     setDialing(true);
@@ -1305,8 +1617,9 @@ export default function Cockpit() {
     setNotes("");
     setDtmfSent("");
     api("/api/call", { number: n })
-      .then((d) => {
+      .then(async (d) => {
         if (d.lead) setLead(d.lead);
+        if (d.originate && d.callId) await originateTwilio(d.callId);
         setManualNumber("");
       })
       .catch(() => {})
@@ -1314,7 +1627,7 @@ export default function Cockpit() {
         dialingRef.current = false;
         setDialing(false);
       });
-  }, [api, manualNumber]);
+  }, [api, manualNumber, clearLeftoverElksSessions, originateTwilio]);
   const hangup = useCallback(() => {
     const sessions = new Set(elksSessionsRef.current);
     if (elksRtcRef.current.session) sessions.add(elksRtcRef.current.session);
@@ -1345,12 +1658,62 @@ export default function Cockpit() {
       .catch(() => {});
   }, [api, flash]);
 
-  /** Audio-path test: dials your own number so you can answer and confirm two-way audio. */
+  /** 💬 Fill the SMS form with the standard pitch for this lead (you review it, then Send). */
+  const textPitch = useCallback(() => {
+    const l = leadRef.current;
+    if (!l) return;
+    const to = smsTarget(l);
+    if (!to) return flash("⚠ no mobile for this lead — a landline can't get texts");
+    setSmsTo(to);
+    setSmsBody(fillTemplate(templates[templateLang(l)].sms, l, { booking: bookingUrl }));
+    setSmsLeadId(l.id);
+    setSmsOpen(true);
+    setTimeout(() => smsBodyRef.current?.focus(), 50);
+  }, [templates, bookingUrl, flash]);
+
+  /** ✉ Open the standard email to this lead as a draft in your own mail app (never a bulk sender). */
+  const emailPitch = useCallback(() => {
+    const l = leadRef.current;
+    if (!l) return;
+    if (!l.email) return flash("⚠ no email on this lead");
+    const t = templates[templateLang(l)];
+    const subject = fillTemplate(t.emailSubject, l, { booking: bookingUrl });
+    const body = fillTemplate(t.emailBody, l, { booking: bookingUrl });
+    window.location.href = `mailto:${encodeURIComponent(l.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    flash(`✉ email draft opened for ${l.email}`);
+  }, [templates, bookingUrl, flash]);
+
+  /** The DB can still say "live" after a reload killed the browser client. Dialing then rings nobody. */
+  const browserLineReady = () =>
+    session?.mode !== "rtc" || provider !== "twilio" || twilioRef.current.device?.state === "registered";
+
+  /** Audio-path test. On Twilio this rings the operator's own mobile as if it were a lead. */
   const testCall = useCallback(() => {
+    if (provider === "twilio") {
+      if (!operatorPhone) {
+        setError("Set your mobile number first (OPERATOR_PHONE)");
+        return;
+      }
+      if (!browserLineReady()) {
+        setError("Browser line dropped — click End line, then Start line, then call your phone.");
+        return;
+      }
+      setOutcome(null);
+      setNotes("");
+      setDtmfSent("");
+      api("/api/test-call", { number: operatorPhone })
+        .then(async (d) => {
+          if (d.lead) setLead(d.lead);
+          if (d.originate && d.callId) await originateTwilio(d.callId);
+          flash(`📱 ringing ${d.to} — answer and talk: you should hear yourself in the browser and vice versa`);
+        })
+        .catch((e: any) => setError(e?.message || "Test call failed"));
+      return;
+    }
     api("/api/test-call", {})
       .then((d) => flash(`📞 test call ringing ${d.to} — answer it to check audio`))
       .catch((e: any) => setError(e?.message || "Test call failed"));
-  }, [api, flash]);
+  }, [api, flash, provider, operatorPhone, session?.mode, originateTwilio]);
 
   /**
    * End-to-end self test on the browser line: a real lead-style dial to the operator's own mobile.
@@ -1361,21 +1724,35 @@ export default function Cockpit() {
       setError("Set your mobile number first (OPERATOR_PHONE)");
       return;
     }
+    if (!browserLineReady()) {
+      setError("Browser line dropped — click End line, then Start line, then call your phone.");
+      return;
+    }
     setOutcome(null);
     setNotes("");
     setDtmfSent("");
     api("/api/test-call", { number: operatorPhone })
-      .then((d) => {
+      .then(async (d) => {
         if (d.lead) setLead(d.lead);
+        if (d.originate && d.callId) await originateTwilio(d.callId);
         flash(`📱 ringing ${d.to} — answer and talk: you should hear yourself in the browser and vice versa`);
       })
       .catch((e: any) => setError(e?.message || "Test call failed"));
-  }, [api, flash, operatorPhone]);
+  }, [api, flash, operatorPhone, session?.mode, provider, originateTwilio]);
 
   const saveOutcome = useCallback(
     (skip = false) => {
       const l = leadRef.current;
       if (!l || (!skip && !outcome)) return;
+      // Never leave a call behind when moving on: a prospect on the line must be hung up on
+      // deliberately; a dial still ringing is ended here so it can't block the next dial.
+      if (callActiveRef.current) {
+        if (callStatusRef.current === "answered") {
+          flash("📞 Still on the call — hang up (H) first, then log it");
+          return;
+        }
+        hangup();
+      }
       setBusy(true);
       const country = regionRef.current || undefined;
       const source = sourceRef.current || undefined;
@@ -1386,14 +1763,46 @@ export default function Cockpit() {
           setCounts(d.counts);
           setOutcome(null);
           setNotes("");
-          setCall(null);
+          if (skip) flash(`${l.company} removed — won't come back`);
+          // A call still open (hang up in flight, or it failed) keeps Hang up / H on the next card.
+          if (callActiveRef.current) setCarriedCompany(l.company || l.phone_e164 || "previous lead");
+          else setCall(null);
           notesRef.current?.blur();
         })
         .catch(() => {})
         .finally(() => setBusy(false));
     },
-    [api, outcome, notes]
+    [api, outcome, notes, flash, hangup]
   );
+
+  // "Later": put this lead off for 24h (it stays queued and comes back by itself) and move on.
+  const laterLead = useCallback(() => {
+    const l = leadRef.current;
+    if (!l) return;
+    if (callActiveRef.current) {
+      flash("📞 On a call — hang up (H) first, then put it off");
+      return;
+    }
+    setBusy(true);
+    api("/api/queue/later", { leadId: l.id, hours: 24, country: regionRef.current || undefined, source: sourceRef.current || undefined })
+      .then((d) => {
+        setLead(d.currentLead);
+        setQueue(d.queue);
+        setCounts(d.counts);
+        setOutcome(null);
+        setNotes("");
+        setCall(null);
+        flash(`⏭ ${l.company} put off until tomorrow`);
+      })
+      .catch(() => {})
+      .finally(() => setBusy(false));
+  }, [api, flash]);
+
+  const toggleFresh = useCallback(() => {
+    api("/api/queue/fresh", { on: !freshOnly })
+      .then(() => refresh())
+      .catch(() => {});
+  }, [api, freshOnly, refresh]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -1418,8 +1827,11 @@ export default function Cockpit() {
       }
       const k = e.key.toLowerCase();
       if (k === "p" && !callActive) dial();
-      else if (k === "h" && callActive) hangup();
+      else if (k === "h") hangup();
+      else if (k === "t") textPitch();
+      else if (k === "e") emailPitch();
       else if (k === "s") saveOutcome(true);
+      else if (k === "d") laterLead();
       else if (k === "u") undo();
       else if (k === "b") sendBooking();
       else if (k === "o") {
@@ -1442,7 +1854,7 @@ export default function Cockpit() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [callActive, callStatus, dial, hangup, saveOutcome, undo, sendBooking, sendDtmf]);
+  }, [callActive, callStatus, dial, hangup, saveOutcome, laterLead, undo, sendBooking, sendDtmf, textPitch, emailPitch]);
 
   const statusChip = (() => {
     if (!callActive) return null;
@@ -1460,8 +1872,9 @@ export default function Cockpit() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 font-[family-name:var(--font-geist-sans)]">
       {/* Header */}
-      <header className="flex items-center gap-4 border-b border-zinc-800 px-5 py-3 text-sm">
+      <header className="flex flex-wrap items-center gap-4 border-b border-zinc-800 px-5 py-3 text-sm">
         <span className="font-semibold tracking-tight">RapidDial</span>
+        <a href="/sms" className="text-zinc-400 hover:text-zinc-100">SMS</a>
         <span className="flex items-center gap-1.5">
           <span
             className={`h-2 w-2 rounded-full ${
@@ -1522,16 +1935,18 @@ export default function Cockpit() {
               <button
                 onClick={testCall}
                 title={
-                  provider === "46elks"
-                    ? "Rings your mobile, then bridges to a test number"
-                    : "Dials a test number so you can answer and verify two-way audio"
+                  provider === "twilio"
+                    ? `Rings ${operatorPhone || "your mobile"} from this caller ID — answer and talk to hear the lead path`
+                    : provider === "46elks"
+                      ? "Rings your mobile, then bridges to a test number"
+                      : "Dials a test number so you can answer and verify two-way audio"
                 }
                 className="rounded border border-sky-700 px-2.5 py-1 text-sky-300 hover:bg-sky-950"
               >
                 📞 Test audio
               </button>
             )}
-            {sessionLive && !callActive && session?.mode === "rtc" && provider === "46elks" && (
+            {sessionLive && !callActive && session?.mode === "rtc" && (provider === "46elks" || provider === "twilio") && (
               <button
                 onClick={callMyPhone}
                 title={`Calls your mobile ${operatorPhone || ""} through the browser line — answer and talk to check both directions`}
@@ -1545,20 +1960,26 @@ export default function Cockpit() {
           <>
             <button
               onClick={startBrowserLine}
-              className="rounded border border-emerald-700 px-2.5 py-1 text-emerald-300 hover:bg-emerald-950"
+              disabled={lineStarting}
+              className="rounded border border-emerald-700 px-2.5 py-1 text-emerald-300 hover:bg-emerald-950 disabled:opacity-40"
             >
-              🎧 Start line (browser)
+              {lineStarting ? "Starting line…" : "🎧 Start line (browser)"}
             </button>
             {provider === "vonage" && (
-              <button onClick={startLine} className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-400 hover:bg-zinc-900">
+              <button
+                onClick={startLine}
+                disabled={lineStarting}
+                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-400 hover:bg-zinc-900 disabled:opacity-40"
+              >
                 📱 phone
               </button>
             )}
             {provider === "46elks" && (
               <button
                 onClick={startLine}
+                disabled={lineStarting}
                 title="Rings your mobile first — needs a working phone"
-                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900"
+                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900 disabled:opacity-40"
               >
                 📱 phone (46elks)
               </button>
@@ -1566,8 +1987,9 @@ export default function Cockpit() {
             {provider === "twilio" && (
               <button
                 onClick={startLine}
+                disabled={lineStarting}
                 title="Rings your mobile first, then bridges each lead"
-                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900"
+                className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-500 hover:bg-zinc-900 disabled:opacity-40"
               >
                 📱 phone (Twilio)
               </button>
@@ -1584,10 +2006,37 @@ export default function Cockpit() {
           <option value="46elks">46elks 🇸🇪</option>
           <option value="twilio">Twilio</option>
         </select>
+        {provider === "twilio" && (
+          <div
+            role="group"
+            aria-label="Calling country"
+            className="flex rounded-full border border-zinc-700 bg-zinc-950 p-0.5"
+          >
+            {(["AU", "CA"] as const).map((line) => {
+              const on = twilioLine === line;
+              const number = twilioLines.find((l) => l.line === line)?.number;
+              return (
+                <button
+                  key={line}
+                  type="button"
+                  aria-pressed={on}
+                  disabled={callActive}
+                  onClick={() => switchTwilioLine(line)}
+                  title={number ? `Call ${line === "AU" ? "Australia" : "Canada"} from ${number}` : undefined}
+                  className={`rounded-full px-2.5 py-0.5 transition-[color,background-color,transform] duration-150 ease-out active:scale-[0.97] disabled:opacity-40 ${
+                    on ? "bg-emerald-900 text-emerald-100" : "text-zinc-400 hover:text-zinc-200"
+                  }`}
+                >
+                  {line === "AU" ? "🇦🇺 Australia" : "🇨🇦 Canada"}
+                </button>
+              );
+            })}
+          </div>
+        )}
         <select
           value={region}
           onChange={(e) => changeRegion(e.target.value)}
-          className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300 focus:outline-none"
+          className={`rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300 focus:outline-none ${provider === "twilio" ? "hidden" : ""}`}
         >
           <option value="">🌍 All countries</option>
           {countries.map((c) => (
@@ -1611,11 +2060,18 @@ export default function Cockpit() {
             ))}
           </select>
         )}
+        <button
+          onClick={toggleFresh}
+          title="New leads first: the newest leads that have never been dialed come up first. Leads you already called stay behind them. Untick for callbacks and priority first."
+          className={`rounded border px-2 py-1 ${freshOnly ? "border-emerald-700 bg-emerald-950/40 text-emerald-300" : "border-zinc-700 text-zinc-400 hover:bg-zinc-900"}`}
+        >
+          {freshOnly ? "☑ New leads first" : "☐ New leads first"}
+        </button>
         {micDevices.length > 0 && (
           <select
             value={micDeviceId}
             onChange={(e) => selectMic(e.target.value)}
-            title="Microphone for the call (applies to a live call after End + Start line)"
+            title="Input for the green bar and the call. Changing it moves the bar onto that mic immediately."
             className="max-w-[150px] truncate rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-zinc-300 focus:outline-none"
           >
             <option value="">🎤 Default mic</option>
@@ -1645,6 +2101,11 @@ export default function Cockpit() {
           🔊 test
         </button>
         <span className="ml-auto flex items-center gap-4 text-zinc-500">
+          {provider === "twilio" ? (
+            <span className="rounded px-2 py-0.5 font-mono text-zinc-300" title="Caller ID the lead sees">
+              {twilioLine === "CA" ? "🇨🇦" : "🇦🇺"} CID {callerId}
+            </span>
+          ) : (
           <button
             type="button"
             onClick={async () => {
@@ -1664,13 +2125,25 @@ export default function Cockpit() {
             {callerRegion === "US" ? "🇺🇸" : "🇸🇪"} CID {callerId}
             {callerOverride ? " 🔒" : " ·auto"}
           </button>
+          )}
           {balance !== null && (
             <span className={balance < (balanceCurrency === "SEK" ? 5 : 1) ? "text-red-400" : ""}>
-              {balanceCurrency === "SEK" ? `${balance.toFixed(2)} kr` : `€${balance.toFixed(2)}`}
+              {balanceCurrency === "SEK"
+                ? `${balance.toFixed(2)} kr`
+                : balanceCurrency === "USD"
+                  ? `$${balance.toFixed(2)}`
+                  : `€${balance.toFixed(2)}`}
             </span>
           )}
           <span>{counts.callsToday} calls today</span>
-          <span>{counts.queued} queued</span>
+          {counts.callWindow && (
+            <span className="text-emerald-300/90" title="Queue is leads whose local time is 09:00–12:00 or 13:00–16:00">
+              {counts.callWindow}
+            </span>
+          )}
+          <span title={counts.mapsOnly ? `${counts.mapsHidden ?? 0} hidden: already on Google, too generic, or not checked yet` : counts.callWindow ? `In the calling window (${counts.callWindow})` : ""}>
+            {counts.queued} queued{counts.mapsOnly ? " · Google fit" : ""}
+          </span>
           {provider === "46elks" && (
             <button
               type="button"
@@ -1850,6 +2323,7 @@ export default function Cockpit() {
               className="w-48 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-sm text-zinc-200"
             />
             <input
+              ref={smsBodyRef}
               value={smsBody}
               onChange={(e) => setSmsBody(e.target.value)}
               placeholder="Text message…"
@@ -1886,10 +2360,22 @@ export default function Cockpit() {
                 >
                   <div className="flex justify-between gap-2 text-xs text-zinc-500">
                     {(m.from_e164 || "").replace(/\D/g, "") === "46766861525" ? (
-                      <span className="font-mono text-sky-400">→ {m.to_e164} (sent)</span>
+                      <span className="text-sky-400">
+                        → {m.lead_company && <span className="font-semibold text-sky-200">{m.lead_company} · </span>}
+                        <span className="font-mono">{m.to_e164}</span> (sent)
+                      </span>
                     ) : (
-                      <span className="font-mono">
-                        {m.from_e164}
+                      <span>
+                        {m.lead_company ? (
+                          <span className="font-semibold text-zinc-200">
+                            {m.lead_company}
+                            {m.lead_name ? <span className="font-normal text-zinc-400"> · {m.lead_name}</span> : null}
+                            {" · "}
+                          </span>
+                        ) : (
+                          <span className="text-zinc-600">unknown · </span>
+                        )}
+                        <span className="font-mono">{m.from_e164}</span>
                         <button
                           type="button"
                           onClick={(e) => {
@@ -1985,20 +2471,22 @@ export default function Cockpit() {
           </button>
         </div>
       )}
-      {(session?.mode === "rtc" || micActive) && (
-        <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900/40 px-5 py-2 text-xs text-zinc-400">
-          <span>🎤 mic</span>
-          <span className="inline-block h-2 w-40 overflow-hidden rounded bg-zinc-800">
-            <span className="block h-full bg-emerald-500 transition-[width] duration-75" style={{ width: `${micLevel}%` }} />
-          </span>
-          <span className="w-8 tabular-nums">{micLevel}%</span>
-          <span className="text-zinc-700">|</span>
-          <span>{rtcDiag || (session?.mode === "rtc" ? "starting line…" : "🎤 mic live — speak to test")}</span>
-          <span className="ml-auto text-zinc-600">speak to test mic · stuck? open chrome://webrtc-internals</span>
-        </div>
-      )}
+      <div className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900/40 px-5 py-2 text-xs text-zinc-400">
+        <span className={micLevel > 4 ? "max-w-[240px] truncate text-emerald-300" : "max-w-[240px] truncate text-zinc-200"} title={micCaptureLabel || "Default mic"}>
+          🎤 {micCaptureLabel || micDevices.find((d) => d.deviceId === micDeviceId)?.label || "Default mic"}
+        </span>
+        <span className="inline-block h-2.5 w-40 overflow-hidden rounded bg-zinc-800" title="Level of the selected input">
+          <span className="block h-full bg-emerald-500 transition-[width] duration-75" style={{ width: `${micLevel}%` }} />
+        </span>
+        <span className="w-8 tabular-nums">{micLevel}%</span>
+        <span className={micLevel > 4 ? "text-emerald-400" : "text-amber-400/90"}>
+          {micLevel > 4 ? "capturing" : micActive ? "no signal — speak, or pick another mic" : "click the page to arm the mic"}
+        </span>
+        <span className="text-zinc-700">|</span>
+        <span className="truncate">{rtcDiag || (session?.mode === "rtc" ? "line up" : "")}</span>
+      </div>
 
-      <main className="grid grid-cols-[1fr_280px] gap-0">
+      <main className="grid grid-cols-1 gap-0 md:grid-cols-[1fr_280px]">
         {/* Lead card + call controls */}
         <section className="flex min-h-[calc(100vh-49px)] flex-col gap-4 p-6">
           {/* Manual dial — call any number, queue or not */}
@@ -2034,6 +2522,14 @@ export default function Cockpit() {
                   {lead.priority === 0 && (
                     <span className="rounded bg-sky-950 px-2 py-0.5 text-xs font-medium text-sky-300">CALLBACK DUE</span>
                   )}
+                  {lead.call_local && (
+                    <span
+                      className={`rounded px-2 py-0.5 text-xs font-medium ${lead.call_open ? "bg-emerald-950/70 text-emerald-300" : "bg-zinc-900 text-zinc-500"}`}
+                      title="Lead local time. The queue prefers 09:00–12:00 and 13:00–16:00."
+                    >
+                      {lead.call_local}
+                    </span>
+                  )}
                 </div>
                 <p className="mt-1 text-zinc-400">
                   {[`${lead.first_name ?? ""} ${lead.last_name ?? ""}`.trim(), lead.title].filter(Boolean).join(" — ") || "No contact name"}
@@ -2044,6 +2540,7 @@ export default function Cockpit() {
                     .filter(Boolean)
                     .join(" · ")}
                 </p>
+                {lead.maps_reason && <p className="mt-2 max-w-xl text-sm text-emerald-300/90">{lead.maps_reason}</p>}
                 <div className="mt-3 flex gap-2 text-sm">
                   {website && (
                     <a href={website} target="_blank" className="rounded border border-zinc-700 px-2.5 py-1 text-zinc-300 hover:bg-zinc-900">
@@ -2074,12 +2571,24 @@ export default function Cockpit() {
                   >
                     Call <kbd className="ml-1 text-emerald-200/70">P</kbd>
                   </button>
+                ) : null}
+                {!callActive ? (
+                  <button
+                    onClick={hangup}
+                    title="Ends any call still up (also if the cockpit lost track of it)"
+                    className="rounded-md border border-red-800 px-4 py-3 text-sm font-semibold text-red-300 hover:bg-red-950"
+                  >
+                    Hang up <kbd className="ml-1 text-red-300/60">H</kbd>
+                  </button>
                 ) : (
                   <button onClick={hangup} className="rounded-md bg-red-700 px-8 py-3 text-lg font-semibold text-white hover:bg-red-600">
                     Hang up <kbd className="ml-1 text-red-200/70">H</kbd>
                   </button>
                 )}
                 {statusChip}
+                {callActive && call && call.lead_id !== lead.id && (
+                  <span className="text-sm text-amber-300">↩ ending call to {carriedCompany ?? "previous lead"}…</span>
+                )}
                 <button
                   onClick={sendBooking}
                   disabled={!lead.email}
@@ -2087,6 +2596,29 @@ export default function Cockpit() {
                   title={lead.email ? `Email ${lead.email} your booking link` : "Lead has no email"}
                 >
                   📅 Send booking <kbd className="text-zinc-600">B</kbd>
+                </button>
+                <button
+                  onClick={textPitch}
+                  disabled={provider !== "46elks"}
+                  className="rounded border border-sky-800 px-3 py-1.5 text-sm text-sky-300 hover:bg-sky-950 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:text-zinc-600"
+                  title={smsTarget(lead) ? `Fill the SMS pitch to ${smsTarget(lead)} — review, then Send` : "No mobile for this lead (landlines can't get texts)"}
+                >
+                  💬 Text pitch <kbd className="text-zinc-600">T</kbd>
+                </button>
+                <button
+                  onClick={emailPitch}
+                  disabled={!lead.email}
+                  className="rounded border border-sky-800 px-3 py-1.5 text-sm text-sky-300 hover:bg-sky-950 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:text-zinc-600"
+                  title={lead.email ? `Open the standard email to ${lead.email} in your mail app` : "Lead has no email"}
+                >
+                  ✉ Email <kbd className="text-zinc-600">E</kbd>
+                </button>
+                <button
+                  onClick={() => setTplOpen((v) => !v)}
+                  className="rounded border border-zinc-700 px-2 py-1.5 text-sm text-zinc-400 hover:bg-zinc-900"
+                  title="Edit the standard SMS pitch and email"
+                >
+                  ✎ Templates
                 </button>
                 {!sessionLive && !callActive && <span className="text-sm text-zinc-500">Start the line first ↑</span>}
                 {inWrapup && <span className="text-sm text-zinc-400">Call ended — log the outcome ↓</span>}
@@ -2108,6 +2640,23 @@ export default function Cockpit() {
                   </div>
                 )}
               </div>
+
+              {tplOpen && (
+                <TemplateEditor
+                  lang={templateLang(lead)}
+                  value={templates[templateLang(lead)]}
+                  onChange={(lang, t) => {
+                    setTemplates((prev) => {
+                      const next = { ...prev, [lang]: t };
+                      try {
+                        localStorage.setItem("dialer-templates", JSON.stringify(next));
+                      } catch {}
+                      return next;
+                    });
+                  }}
+                  preview={(text) => fillTemplate(text, lead, { booking: bookingUrl })}
+                />
+              )}
 
               {/* Last call intel (Whisper + GPT, lands ~20s after each hangup) */}
               {intel?.analysis && !intel.analysis.error && (
@@ -2141,10 +2690,18 @@ export default function Cockpit() {
                     </button>
                   ))}
                   <button
-                    onClick={() => saveOutcome(true)}
+                    onClick={laterLead}
+                    title="Put this lead off for 24h — it stays in the queue and comes back tomorrow"
                     className="ml-auto rounded border border-zinc-800 px-3 py-1.5 text-sm text-zinc-500 hover:bg-zinc-900"
                   >
-                    <kbd className="mr-1.5 text-zinc-600">S</kbd>Skip
+                    <kbd className="mr-1.5 text-zinc-600">D</kbd>Later
+                  </button>
+                  <button
+                    onClick={() => saveOutcome(true)}
+                    title="Not a lead we can help. Leaves the queue and does not come back. U brings the last one back."
+                    className="rounded border border-zinc-800 px-3 py-1.5 text-sm text-zinc-500 hover:bg-zinc-900"
+                  >
+                    <kbd className="mr-1.5 text-zinc-600">S</kbd>Not needed
                   </button>
                 </div>
                 <div className="mt-3 flex gap-2">
@@ -2180,7 +2737,13 @@ export default function Cockpit() {
                 ))}
             </>
           ) : (
-            <div className="flex flex-1 items-center justify-center text-zinc-600">Queue empty — import more leads.</div>
+            <div className="flex flex-1 items-center justify-center text-zinc-600">
+              {region || source
+                ? `No leads match ${[region, source].filter(Boolean).join(" + ")}. Change the country/source dropdown (top bar).`
+                : counts.mapsOnly
+                  ? "No Google-cleared leads. Run npm run maps:fit to refresh the check."
+                  : "Queue empty — import more leads."}
+            </div>
           )}
         </section>
 
@@ -2194,11 +2757,15 @@ export default function Cockpit() {
                 className={`rounded px-2 py-1.5 text-sm ${i === 0 ? "bg-zinc-900 text-zinc-100" : "text-zinc-500"}`}
               >
                 <span className="block truncate">
-                  {q.priority === 0 && <span className="mr-1 text-sky-400">↩</span>}
+                  {q.priority === 0 && <span className="mr-1 text-sky-400">↩ callback ·</span>}
                   {q.company}
                 </span>
                 <span className="block truncate text-xs text-zinc-600">
                   {`${q.first_name ?? ""} ${q.last_name ?? ""}`.trim() || q.city || q.phone_e164}
+                  {q.call_local && (
+                    <span className={q.call_open ? "text-emerald-700" : "text-zinc-700"}> · {q.call_local}</span>
+                  )}
+                  {q.gbp_status === "none" && <span className="text-emerald-600"> · no GBP</span>}
                 </span>
               </li>
             ))}
@@ -2235,5 +2802,40 @@ function UploadButton({ onDone }: { onDone: () => void }) {
         {msg ?? "Import CSV"}
       </button>
     </>
+  );
+}
+
+/** ✎ Templates: edit the standard SMS pitch + email for the current lead's language, with a live preview. */
+function TemplateEditor({
+  lang,
+  value,
+  onChange,
+  preview,
+}: {
+  lang: Lang;
+  value: Templates;
+  onChange: (lang: Lang, t: Templates) => void;
+  preview: (text: string) => string;
+}) {
+  const field = "w-full rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm text-zinc-200";
+  return (
+    <div className="space-y-2 rounded-md border border-zinc-800 bg-zinc-900/60 p-3 text-sm">
+      <div className="flex items-center justify-between text-xs text-zinc-500">
+        <span>
+          Templates ({lang === "sv" ? "Swedish leads" : "English leads"}) · placeholders {"{first} {company} {city} {website} {hook} {booking}"} · keep the opt-out line
+        </span>
+        <button onClick={() => onChange(lang, DEFAULT_TEMPLATES[lang])} className="text-zinc-400 hover:text-zinc-200">
+          reset to default
+        </button>
+      </div>
+      <label className="block text-xs text-zinc-400">SMS pitch</label>
+      <textarea rows={3} className={field} value={value.sms} onChange={(e) => onChange(lang, { ...value, sms: e.target.value })} />
+      <p className="whitespace-pre-wrap text-xs text-zinc-500">→ {preview(value.sms)}</p>
+      <label className="block text-xs text-zinc-400">Email subject</label>
+      <input className={field} value={value.emailSubject} onChange={(e) => onChange(lang, { ...value, emailSubject: e.target.value })} />
+      <label className="block text-xs text-zinc-400">Email body</label>
+      <textarea rows={8} className={field} value={value.emailBody} onChange={(e) => onChange(lang, { ...value, emailBody: e.target.value })} />
+      <p className="whitespace-pre-wrap text-xs text-zinc-500">→ {preview(value.emailBody)}</p>
+    </div>
   );
 }

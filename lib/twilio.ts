@@ -1,5 +1,6 @@
 import crypto from "crypto";
-import { config } from "./config";
+import { config, twilioNumberForLine } from "./config";
+import { getTwilioLine } from "./provider";
 
 /**
  * Minimal Twilio Voice REST client — no SDK, same shape as lib/elks.ts.
@@ -104,12 +105,15 @@ export async function getBalance(): Promise<{ amount: number; currency: string }
 const b64url = (b: Buffer | string) => Buffer.from(b).toString("base64url");
 
 /**
- * Voice access token for the browser Device (incoming only — every leg is server-originated,
- * so no TwiML App / outgoing grant is needed). Hand-rolled HS256 JWT in Twilio's format.
+ * Voice access token for the browser Device. Hand-rolled HS256 JWT in Twilio's format.
+ * `applicationSid` adds the outgoing grant so Device.connect places the call. An inbound
+ * `client:<identity>` invite is delivered to every registered tab, and any reject is SIP 486.
  */
-export function voiceAccessToken(identity: string, ttlSeconds = 3600): string {
+export function voiceAccessToken(identity: string, applicationSid?: string, ttlSeconds = 3600): string {
   const now = Math.floor(Date.now() / 1000);
   const header = { typ: "JWT", alg: "HS256", cty: "twilio-fpa;v=1" };
+  const voice: Record<string, unknown> = { incoming: { allow: true } };
+  if (applicationSid) voice.outgoing = { application_sid: applicationSid };
   const payload = {
     jti: `${config.twilioApiKeySid}-${now}`,
     iss: config.twilioApiKeySid,
@@ -117,11 +121,27 @@ export function voiceAccessToken(identity: string, ttlSeconds = 3600): string {
     iat: now,
     nbf: now,
     exp: now + ttlSeconds,
-    grants: { identity, voice: { incoming: { allow: true } } },
+    grants: { identity, voice },
   };
   const unsigned = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
   const sig = crypto.createHmac("sha256", config.twilioApiKeySecret).update(unsigned).digest();
   return `${unsigned}.${b64url(sig)}`;
+}
+
+/** Create or update the TwiML App the browser calls. VoiceUrl must be the current tunnel. */
+export async function upsertVoiceApp(existingSid: string | null, voiceUrl: string): Promise<string> {
+  const body = new URLSearchParams({
+    FriendlyName: "RapidDial browser",
+    VoiceUrl: voiceUrl,
+    VoiceMethod: "POST",
+  });
+  if (existingSid) {
+    const res = await twilioFetch(`/Applications/${encodeURIComponent(existingSid)}.json`, { method: "POST", body });
+    if (res.ok) return ((await res.json()) as { sid: string }).sid;
+    if (res.status !== 404) await ok(res, "voice app");
+  }
+  const created = await ok<{ sid: string }>(await twilioFetch("/Applications.json", { method: "POST", body }), "voice app");
+  return created.sid;
 }
 
 /**
@@ -151,9 +171,14 @@ export function playTwiml(url: string, loops = 2): string {
   return `<Response><Play loop="${loops}">${esc(url)}</Play></Response>`;
 }
 
+/** Caller ID for the line selected at boot (Australia or Canada). */
+export function activeTwilioNumber(): string {
+  return twilioNumberForLine(getTwilioLine());
+}
+
 export function assertTwilioReady(mode: "phone" | "rtc"): string | null {
   if (!config.twilioAccountSid || !config.twilioAuthToken) return "Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN";
-  if (!config.twilioNumber) return "Missing TWILIO_NUMBER (your Twilio caller ID, E.164)";
+  if (!activeTwilioNumber()) return "Missing TWILIO_AUSTRALIA_NUMBER / TWILIO_CANADA_NUMBER (E.164)";
   if (mode === "rtc" && (!config.twilioApiKeySid || !config.twilioApiKeySecret))
     return "Browser line needs TWILIO_API_KEY_SID / TWILIO_API_KEY_SECRET (Twilio console → API keys)";
   return null;

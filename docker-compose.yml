@@ -1,0 +1,30 @@
+services:
+  app:
+    image: sms-campaign:local
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3101:3100"
+    env_file:
+      - .env.local
+    environment:
+      DIALER_DB: /app/data/dialer.db
+    volumes:
+      - smsdata:/app/data
+    command: npm run start
+
+  worker:
+    image: sms-campaign:local
+    restart: unless-stopped
+    env_file:
+      - .env.local
+    environment:
+      DIALER_DB: /app/data/dialer.db
+    volumes:
+      - smsdata:/app/data
+    command: npx tsx scripts/sms-worker.ts
+    depends_on:
+      - app
+
+volumes:
+  smsdata:

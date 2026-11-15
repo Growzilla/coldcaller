@@ -1,7 +1,7 @@
 import path from "path";
 import { parse } from "csv-parse/sync";
 import { getDb } from "./db";
-import { toE164 } from "./phone";
+import { isDialableMobile, toE164 } from "./phone";
 
 // Direct-dial columns in preference order — a real person's line.
 const DIRECT_COLS = ["direct_dial", "best_dial", "mobile_or_best", "phone"];
@@ -57,8 +57,8 @@ export function importCsvText(text: string, sourceName: string, priority = 2): I
         if (phone) break;
       }
     }
-    if (!phone) {
-      // No dialable direct number → not useful in a dialer queue (and NULL phones break dedupe).
+    if (!phone || !isDialableMobile(phone)) {
+      // No dialable mobile → not useful in a dialer queue. SE/AU landlines are skipped; other countries pass.
       noPhone++;
       continue;
     }

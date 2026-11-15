@@ -3,6 +3,7 @@ import { config } from "@/lib/config";
 import { insertInboundSms } from "@/lib/db";
 import { publish } from "@/lib/bus";
 import { isSignedWebhook } from "@/lib/elks";
+import { ingestInboundSms } from "@/lib/sms/inbound";
 
 export const dynamic = "force-dynamic";
 
@@ -69,6 +70,14 @@ export async function POST(req: Request) {
     created_at: p.created || null,
   });
   if (row) publish({ type: "sms", payload: row });
+  // Campaign inbox, opt-out, and positive-reply alert. Must not change the 204.
+  if (id && from && direction === "incoming") {
+    try {
+      await ingestInboundSms({ id, from, message });
+    } catch (err) {
+      console.error("[sms] ingest failed", err);
+    }
+  }
 
   return new NextResponse(null, { status: 204 });
 }

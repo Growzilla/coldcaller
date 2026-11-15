@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { config } from "@/lib/config";
-import { insertInboundSms } from "@/lib/db";
+import { getDb, insertInboundSms } from "@/lib/db";
 import { publish } from "@/lib/bus";
 import { sendSms } from "@/lib/elks";
 import { toE164 } from "@/lib/phone";
@@ -16,7 +16,7 @@ const MAX_LEN = 1600;
  *   { to: "+46…" | "07x…", message: "…" }
  */
 export async function POST(req: Request) {
-  const { to, message } = await req.json().catch(() => ({}));
+  const { to, message, leadId } = await req.json().catch(() => ({}));
   const e164 = toE164(String(to ?? ""), "SE");
   if (!e164) return NextResponse.json({ error: "Couldn't parse the recipient number" }, { status: 400 });
   const text = String(message ?? "").trim();
@@ -35,6 +35,11 @@ export async function POST(req: Request) {
       created_at: sent.created ?? null,
     });
     if (row) publish({ type: "sms", payload: row });
+    // Sent from a lead card (💬 Text pitch): stamp it on the lead like 📅 booking sends.
+    if (leadId) {
+      const stamp = `💬 SMS sent to ${e164} ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`;
+      getDb().prepare("UPDATE leads SET prior_notes=COALESCE(prior_notes || char(10), '') || ? WHERE id=?").run(stamp, Number(leadId));
+    }
     return NextResponse.json({
       ok: true,
       id: sent.id,

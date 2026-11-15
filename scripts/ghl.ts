@@ -39,7 +39,7 @@ async function main() {
 
   if (cmd === "pull") {
     const s = await pullQueue();
-    console.log(`✓ pulled ${s.fetched} opportunities: ${s.inserted} new, ${s.linked} linked to existing leads, ${s.requeued} re-queued, ${s.noPhone} without phone, ${s.nixHeld} sole traders held for NIX wash, ${s.scored} ICP-scored`);
+    console.log(`✓ pulled ${s.fetched} opportunities: ${s.inserted} new, ${s.linked} linked to existing leads, ${s.requeued} re-queued, ${s.noPhone} without phone, ${s.landline} landlines held, ${s.nixHeld} sole traders held for NIX wash, ${s.scored} ICP-scored`);
     return;
   }
 

@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import { parse } from "csv-parse/sync";
 import { getDb } from "./db";
-import { toE164 } from "./phone";
+import { isDialableMobile, toE164 } from "./phone";
 import { hostOf } from "./site-verify";
 
 /**
@@ -686,7 +686,7 @@ export function applyRanking(): { ranked: number; delta: boolean; requeuedGood: 
       const rank = fixed ?? Math.max(1, Math.min(99, Math.round(nudged)));
       setRank.run(rank, p.id);
       leadScore.run(rank, p.phone);
-      if (p.verdict === "good") requeuedGood += requeue.run(p.phone).changes;
+      if (p.verdict === "good" && isDialableMobile(p.phone)) requeuedGood += requeue.run(p.phone).changes;
       if (p.verdict === "bad") removedBad += drop.run(p.phone).changes;
     }
   })();

@@ -21,10 +21,13 @@
     "ghl": "tsx scripts/ghl.ts",
     "review:import": "tsx scripts/review-import.ts",
     "review:rank": "tsx scripts/review-rank.ts",
+    "maps:fit": "tsx scripts/maps-fit.ts",
     "review:sites": "tsx scripts/review-verify-sites.ts",
     "review:csv": "tsx scripts/review-ghl-csv.ts",
     "review:cleanup": "tsx scripts/review-ghl-cleanup.ts",
-    "review:apply-rows": "tsx scripts/review-ghl-apply-rows.ts"
+    "review:apply-rows": "tsx scripts/review-ghl-apply-rows.ts",
+    "sms:worker": "tsx scripts/sms-worker.ts",
+    "sms:test": "tsx scripts/sms-campaign-test.ts"
   },
   "dependencies": {
     "@twilio/voice-sdk": "^2.18.5",

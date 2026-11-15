@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { toE164 } from "./phone";
 
 // Fallback: pull Vonage creds from the workspace-level .env if not set locally.
 // Optional and machine-specific; a missing file is ignored. Override with RAPIDDIAL_SHARED_ENV.
@@ -46,10 +47,13 @@ export const config = {
   twilioAuthToken: env("TWILIO_AUTH_TOKEN"),
   twilioApiKeySid: env("TWILIO_API_KEY_SID"),
   twilioApiKeySecret: env("TWILIO_API_KEY_SECRET"),
-  /** Twilio-owned number (E.164) — caller ID on every lead leg. */
-  twilioNumber: env("TWILIO_NUMBER"),
-  /** Browser Device identity — Twilio rings `client:<identity>` for each dial. */
-  twilioClientIdentity: env("TWILIO_CLIENT_IDENTITY", "rapiddial-operator"),
+  /** Twilio-owned numbers (E.164). Parentheses in the env value are stripped. */
+  twilioAustraliaNumber: normalizeTwilioNumber(env("TWILIO_AUSTRALIA_NUMBER")),
+  twilioCanadaNumber: normalizeTwilioNumber(env("TWILIO_CANADA_NUMBER")),
+  /** Legacy single number. Used only when the AU/CA numbers above are empty. */
+  twilioNumber: normalizeTwilioNumber(env("TWILIO_NUMBER")),
+  /** Fallback browser Device identity. rtc dials use Device.connect, not an inbound ring to this name. */
+  twilioClientIdentity: env("TWILIO_CLIENT_IDENTITY", "rapiddial-operator-2"),
   elksApiUsername: env("46ELKS_API_USERNAME"),
   elksApiPassword: env("46ELKS_API_PASSWORD"),
   elksNumber: env("46ELKS_NUMBER", "+46766861525"),
@@ -96,6 +100,11 @@ export const config = {
   ghlUserId: env("GHL_USER_ID", "LHS2dyB4LUChw6in1ANT"),
   /** Sole traders (tag nix-required) need a NIX-Telefon wash first — kept out of the queue unless "1". */
   ghlIncludeNix: env("GHL_INCLUDE_NIX") === "1",
+  /**
+   * Places API (New) Text Search. This is the Google check behind the dial queue.
+   * A Gemini key on the same Google project works when Places API is enabled on it.
+   */
+  googlePlacesKey: env("GOOGLE_PLACES_API_KEY") || env("GEMINI_API_KEY"),
 };
 
 /**
@@ -113,6 +122,63 @@ export const CALLER_IDS: Record<"US" | "SE", string> = {
 /** Swedish caller ID when provider=46elks. */
 export const ELKS_CALLER_ID = env("46ELKS_NUMBER", "+46766861525");
 
+export type TwilioLine = "AU" | "CA";
+
+/** "+61(485)068174" → "+61485068174". Empty when it is not a plausible E.164 number. */
+export function normalizeTwilioNumber(raw: string | null | undefined): string {
+  return toE164(raw || "") || "";
+}
+
+export function twilioCountry(line: TwilioLine): "Australia" | "Canada" {
+  return line === "AU" ? "Australia" : "Canada";
+}
+
+/** The Twilio number for a line. A null line falls back to the legacy single number, then AU, then CA. */
+export function twilioNumberForLine(line: TwilioLine | null | undefined): string {
+  if (line === "AU") return config.twilioAustraliaNumber;
+  if (line === "CA") return config.twilioCanadaNumber;
+  return config.twilioNumber || config.twilioAustraliaNumber || config.twilioCanadaNumber;
+}
+
+export function configuredTwilioLines(): { line: TwilioLine; country: "Australia" | "Canada"; number: string }[] {
+  const out: { line: TwilioLine; country: "Australia" | "Canada"; number: string }[] = [];
+  if (config.twilioAustraliaNumber)
+    out.push({ line: "AU", country: "Australia", number: config.twilioAustraliaNumber });
+  if (config.twilioCanadaNumber) out.push({ line: "CA", country: "Canada", number: config.twilioCanadaNumber });
+  return out;
+}
+
+/**
+ * null when this lead may be dialed on the line. A string is the reason to refuse.
+ * Test calls (source `test`) and the operator's own mobile are allowed, so an audio
+ * check can ring that phone from the AU or CA caller ID. Any other typed number must
+ * match the line's prefix (+61 or +1).
+ */
+export function leadFitsTwilioLine(
+  lead: { country?: string | null; phone_e164?: string | null; source_file?: string | null; company?: string | null },
+  line: TwilioLine
+): string | null {
+  if (lead.source_file === "test") return null;
+  const phone = lead.phone_e164 || "";
+  const mine = globalThis.__operatorPhone || config.operatorPhone || "";
+  if (phone && mine && phone === mine) return null;
+  const country = (lead.country || "").trim().toLowerCase();
+  if (lead.source_file === "manual") {
+    if (line === "AU" && phone.startsWith("+61")) return null;
+    if (line === "CA" && phone.startsWith("+1")) return null;
+    return line === "AU" ? "Australia line only dials +61 numbers." : "Canada line only dials +1 numbers.";
+  }
+  // Prefix is the check. A few rows are tagged Australia with a +43/+49 number — those are not AU calls.
+  const ok =
+    line === "AU"
+      ? phone.startsWith("+61")
+      : (country === "canada" || country === "ca") && phone.startsWith("+1");
+  if (ok) return null;
+  const phrase = line === "AU" ? "an Australian" : "a Canadian";
+  const shown = phone || lead.country || "another country";
+  return `${lead.company || "This lead"} (${shown}) is not ${phrase} number. This line only calls ${twilioCountry(line)}.`;
+}
+
 /** Map a lead's country to the right caller ID region. */
 export function callerRegionForCountry(country?: string | null): "US" | "SE" {
   const c = (country || "").toLowerCase();
@@ -127,7 +193,8 @@ export function callerIdForCountry(
   provider: "vonage" | "46elks" | "twilio" = "vonage"
 ): string {
   if (provider === "46elks") return ELKS_CALLER_ID;
-  if (provider === "twilio") return config.twilioNumber;
+  // Live Twilio dials use twilioNumberForLine(getTwilioLine()) — this is the fallback only.
+  if (provider === "twilio") return config.twilioNumber || config.twilioAustraliaNumber || config.twilioCanadaNumber;
   if (override) return CALLER_IDS[override];
   return CALLER_IDS[callerRegionForCountry(country)];
 }

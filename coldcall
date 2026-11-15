@@ -12,13 +12,15 @@ set -uo pipefail
 # Repo dir = wherever this script really lives (works through the ~/.local/bin symlink and in any clone).
 APP="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 URL="http://localhost:3100"
-# Telephony backend for this session. 46elks is the live one (Vonage creds 401 since 2026-10-07);
-# `COLDCALL_PROVIDER=vonage coldcall` switches back.
-# Precedence: COLDCALL_PROVIDER > DIALER_PROVIDER in .env.local (forks pick theirs there) > 46elks.
+# Twilio is the AU/CA dialer. Australia vs Canada is a toggle in the cockpit, not a boot prompt.
+# COLDCALL_PROVIDER=46elks|vonage keeps the old boot. COLDCALL_LINE=AU|CA forces the toggle once.
 env_provider=$(grep -E '^DIALER_PROVIDER=' "$APP/.env.local" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"' ')
-PROVIDER="${COLDCALL_PROVIDER:-${env_provider:-46elks}}"
+PROVIDER="${COLDCALL_PROVIDER:-${env_provider:-twilio}}"
 DEV_LOG="/tmp/coldcaller-dev.log"
 TUN_LOG="/tmp/coldcaller-tunnel.log"
+LINE=""
+COUNTRY=""
+NUMBER=""
 
 cd "$APP" 2>/dev/null || { echo "✗ coldcaller dir missing: $APP"; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -41,6 +43,26 @@ fi
 # 1b) Provider — set before the tunnel so webhook registration + balance read the right backend.
 curl -s -X POST "$URL/api/provider" -H 'Content-Type: application/json' -d "{\"provider\":\"$PROVIDER\"}" >/dev/null 2>&1
 say "✓ provider: $PROVIDER"
+if [ "$PROVIDER" = "twilio" ]; then
+  case "${COLDCALL_LINE:-}" in
+    AU|au) curl -s -X POST "$URL/api/twilio/line" -H 'Content-Type: application/json' -d '{"line":"AU"}' >/dev/null;;
+    CA|ca) curl -s -X POST "$URL/api/twilio/line" -H 'Content-Type: application/json' -d '{"line":"CA"}' >/dev/null;;
+  esac
+  line_res=$(curl -s "$URL/api/twilio/line")
+  LINE=$(printf '%s' "$line_res" | jq -r '.line // empty' 2>/dev/null)
+  NUMBER=$(printf '%s' "$line_res" | jq -r '.number // empty' 2>/dev/null)
+  COUNTRY=$(printf '%s' "$line_res" | jq -r '.country // empty' 2>/dev/null)
+  if [ -n "$NUMBER" ]; then
+    say "✓ line: $LINE $NUMBER → $COUNTRY leads (switch in the cockpit)"
+  else
+    say "✗ Twilio line has no number — set TWILIO_AUSTRALIA_NUMBER and TWILIO_CANADA_NUMBER"
+    exit 1
+  fi
+  if ! grep -qE '^TWILIO_API_KEY_SID=.+' "$APP/.env.local" /home/god0fm0ney/dev/.env 2>/dev/null; then
+    say "🎧 browser line needs TWILIO_API_KEY_SID + TWILIO_API_KEY_SECRET (Console → API keys)"
+    say "   until then use 📱 phone (Twilio) — it rings your mobile, then the lead sees $NUMBER"
+  fi
+fi
 
 # 2) Tunnel (browser-line + inbound). Restart ONLY if dead/unregistered ----
 # cloudflared auto-updates itself and silently exits (killed the line 2026-06-11),
@@ -75,20 +97,25 @@ else
 fi
 
 # 3b) Morning queue from GHL (GHL is the lead master). Skipped when sync isn't configured.
+# AU/CA batches live in the local DB, not GHL — the country filter below is what you dial.
 pull=$(curl -s -X POST "$URL/api/ghl/pull" 2>/dev/null)
 if [ "$(printf '%s' "$pull" | jq -r '.ok // empty' 2>/dev/null)" = "true" ]; then
-  say "✓ GHL queue pulled: $(printf '%s' "$pull" | jq -r '"\(.inserted) new · \(.requeued) re-queued · \(.fetched) open in GHL · \(.scored // 0) ICP-scored · \(.nixHeld // 0) held (NIX)"')"
+  say "✓ GHL queue pulled: $(printf '%s' "$pull" | jq -r '"\(.inserted) new · \(.requeued) re-queued · \(.fetched) open in GHL · \(.scored // 0) ICP-scored · \(.landline // 0) landlines held · \(.nixHeld // 0) held (NIX)"')"
   state=$(curl -s "$URL/api/state" 2>/dev/null)   # refresh counts after the pull
 elif [ -n "$(printf '%s' "$pull" | jq -r '.error // empty' 2>/dev/null)" ]; then
   say "⚠ GHL pull: $(printf '%s' "$pull" | jq -r '.error')"
 fi
 
 # 4) Balance + queue snapshot ---------------------------------------------
+# Twilio AU/CA: refresh state with the country filter so the count matches the cockpit.
+if [ "$PROVIDER" = "twilio" ] && [ -n "$COUNTRY" ]; then
+  state=$(curl -s "$URL/api/state?country=$(printf '%s' "$COUNTRY" | jq -sRr @uri)" 2>/dev/null)
+fi
 hr
 bal=$(printf '%s' "$state" | jq -r '.balance // empty' 2>/dev/null)
 cur=$(printf '%s' "$state" | jq -r '.balanceCurrency // "EUR"' 2>/dev/null)
 prov=$(printf '%s' "$state" | jq -r '.provider // "vonage"' 2>/dev/null)
-# Same thresholds the server enforces at line start: €1 on Vonage, 5 SEK on 46elks.
+# Same thresholds the server enforces at line start: €1 on Vonage, 5 SEK on 46elks, $1 on Twilio.
 low=$(printf '%s' "$state" | jq -r 'if .provider == "46elks" then (if (.balance // 99) < 5 then 1 else 0 end) else (if (.balance // 9) < 1 then 1 else 0 end) end' 2>/dev/null)
 queued=$(printf '%s' "$state" | jq -r '.counts.queued // 0' 2>/dev/null)
 today=$(printf '%s' "$state" | jq -r '.counts.callsToday // 0' 2>/dev/null)
@@ -96,13 +123,20 @@ if [ -n "$bal" ]; then
   if [ "$prov" = "46elks" ]; then
     printf '💶 46elks balance %.2f %s' "$bal" "$cur"
     [ "$low" = "1" ] && printf '  ⚠️  TOP UP — calls blocked under 5 SEK (46elks.se → Account)'
+  elif [ "$prov" = "twilio" ]; then
+    printf '💶 Twilio balance %.2f %s' "$bal" "$cur"
+    [ "$low" = "1" ] && printf '  ⚠️  TOP UP — under $1 (console.twilio.com → Billing)'
   else
     printf '💶 balance €%.2f' "$bal"
     [ "$low" = "1" ] && printf '  ⚠️  TOP UP — calls blocked under €1 (dashboard.vonage.com → Billing)'
   fi
   echo
 fi
-say "📞 $queued queued · $today calls today"
+if [ -n "$COUNTRY" ]; then
+  say "📞 $queued $COUNTRY queued · $today calls today · calling from $NUMBER"
+else
+  say "📞 $queued queued · $today calls today"
+fi
 if [ "$PROVIDER" = "46elks" ]; then
   # Browser line needs a 46elks WebRTC client number (auto-discovered by the server).
   rtc=$(npm run -s elks:webrtc 2>&1 | head -1)
@@ -113,8 +147,20 @@ fi
 # 5) Open the cockpit ------------------------------------------------------
 hr
 say "→ opening $URL"
-# source=ghl → dial the GHL queue (ICP-ranked, best first); COLDCALL_SOURCE="" shows every source.
-xdg-open "$URL/?provider=$PROVIDER&source=${COLDCALL_SOURCE-ghl}" >/dev/null 2>&1 &
+# Twilio: empty source so the local AU/CA batches show (they are not in GHL).
+# The cockpit toggle picks the country. Sweden: source=ghl. COLDCALL_SOURCE overrides either.
+if [ "$PROVIDER" = "twilio" ]; then
+  OPEN_QS="provider=twilio&source=${COLDCALL_SOURCE-}"
+else
+  OPEN_QS="provider=$PROVIDER&country=&source=${COLDCALL_SOURCE-ghl}"
+fi
+xdg-open "$URL/?$OPEN_QS" >/dev/null 2>&1 &
+if [ "$LINE" = "AU" ] && [ -f "$APP/data/dialer.db" ]; then
+  dncr=$(sqlite3 "$APP/data/dialer.db" "SELECT COUNT(*) FROM leads WHERE status='queued' AND country='Australia' AND phone_e164 LIKE '+614%' AND length(phone_e164)=12 AND prior_notes LIKE '%DNCR wash pending%';" 2>/dev/null || true)
+  if [ -n "$dncr" ] && [ "$dncr" != "0" ]; then
+    say "⚠ $dncr AU mobiles are still marked DNCR wash pending — that note is on the card. Wash before you call them."
+  fi
+fi
 say ""
 say "🎧 Start line (browser) → allow mic → wait for the ✅ AUDIO VERIFIED banner → P to dial."
 say "   If you ever see 🔊❌ or LINE DEAD: End line + Start line (it self-verifies again)."

@@ -1,7 +1,21 @@
 import { NextResponse } from "next/server";
-import { activeSession, activeCall, nextLead, queuePreview, queueCounts, countryBreakdown, sourceBreakdown } from "@/lib/db";
-import { callerIdForCountry, callerRegionForCountry, ELKS_CALLER_ID, config } from "@/lib/config";
-import { assertDialerReady, getCallerIdOverride, getDialerProvider, getOperatorPhone, getProviderBalance } from "@/lib/dialer";
+import { activeSession, activeCall, nextLead, queuePreview, queueCounts, countryBreakdown, sourceBreakdown, freshOnly } from "@/lib/db";
+import {
+  callerIdForCountry,
+  callerRegionForCountry,
+  configuredTwilioLines,
+  ELKS_CALLER_ID,
+  config,
+  twilioNumberForLine,
+} from "@/lib/config";
+import {
+  assertDialerReady,
+  getCallerIdOverride,
+  getDialerProvider,
+  getOperatorPhone,
+  getProviderBalance,
+  getTwilioLine,
+} from "@/lib/dialer";
 
 export const dynamic = "force-dynamic";
 
@@ -26,12 +40,13 @@ export async function GET(req: Request) {
   void import("@/lib/calendly").then((m) => m.checkBookings());
   const provider = getDialerProvider();
   const override = getCallerIdOverride();
+  const twilioLine = provider === "twilio" ? getTwilioLine() : null;
   const lead = nextLead(country, source) ?? null;
   const callerId =
     provider === "46elks"
       ? ELKS_CALLER_ID
       : provider === "twilio"
-        ? config.twilioNumber
+        ? twilioNumberForLine(twilioLine)
         : callerIdForCountry(lead?.country ?? country, override, "vonage");
   const callerRegion = provider === "46elks" ? "SE" : override ?? callerRegionForCountry(lead?.country ?? country);
   const bal = await getBalance();
@@ -41,6 +56,8 @@ export async function GET(req: Request) {
     callerId,
     callerRegion,
     callerOverride: override,
+    twilioLine,
+    twilioLines: configuredTwilioLines(),
     operatorPhone: getOperatorPhone() || null,
     session: activeSession() ?? null,
     call: activeCall() ?? null,
@@ -51,5 +68,7 @@ export async function GET(req: Request) {
     sources: sourceBreakdown(),
     balance: bal?.amount ?? null,
     balanceCurrency: bal?.currency ?? "EUR",
+    freshOnly: freshOnly(), // "New leads first" — newest never-dialed leads, then everyone already called
+    bookingUrl: config.bookingUrl, // {booking} in the SMS / email templates
   });
 }

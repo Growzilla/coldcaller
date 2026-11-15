@@ -1,9 +1,14 @@
 import { NextResponse } from "next/server";
-import { dialLead } from "@/lib/dialer";
-import { getDb, type Lead } from "@/lib/db";
+import { dialLead, getDialerProvider } from "@/lib/dialer";
+import { activeSession, getDb, type Lead } from "@/lib/db";
 import { toE164 } from "@/lib/phone";
 
 export const dynamic = "force-dynamic";
+
+/** Browser rtc places the call with Device.connect. Phone mode stays a server dial. */
+function browserOriginates(): boolean {
+  return getDialerProvider() === "twilio" && activeSession()?.mode === "rtc";
+}
 
 /**
  * Find or create a minimal lead row for an ad-hoc dialed number. Reuses an existing
@@ -16,7 +21,13 @@ function manualLead(e164: string): Lead {
     | Lead
     | undefined;
   if (existing) return existing;
-  const country = e164.startsWith("+1") ? "United States" : e164.startsWith("+46") ? "Sweden" : null;
+  const country = e164.startsWith("+61")
+    ? "Australia"
+    : e164.startsWith("+1")
+      ? "United States"
+      : e164.startsWith("+46")
+        ? "Sweden"
+        : null;
   const id = db
     .prepare("INSERT INTO leads (company, phone_e164, country, source_file, status) VALUES (?,?,?,?,'done')")
     .run("Manual dial", e164, country, "manual").lastInsertRowid as number;
@@ -35,11 +46,11 @@ export async function POST(req: Request) {
         );
       const lead = manualLead(e164);
       const callId = await dialLead(lead.id);
-      return NextResponse.json({ callId, lead });
+      return NextResponse.json({ callId, lead, originate: browserOriginates() });
     }
     if (!leadId) return NextResponse.json({ error: "leadId or number required" }, { status: 400 });
     const callId = await dialLead(Number(leadId));
-    return NextResponse.json({ callId });
+    return NextResponse.json({ callId, originate: browserOriginates() });
   } catch (err: any) {
     return NextResponse.json({ error: err?.message || "Failed to dial" }, { status: 400 });
   }

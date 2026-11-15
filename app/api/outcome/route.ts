@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getDb, nextLead, queuePreview, queueCounts } from "@/lib/db";
+import { getDb, nextLead, queuePreview, queueCounts, passLead, rememberWrapup } from "@/lib/db";
 import { syncCall } from "@/lib/ghl";
 
 export const dynamic = "force-dynamic";
@@ -9,7 +9,7 @@ const OUTCOMES = new Set(["no_answer", "callback", "interested", "not_interested
 /**
  * Log the wrapup for a lead and advance the queue.
  * Body: { leadId, outcome?, notes?, skip?: boolean }
- *  - skip:true  → lead marked skipped, no outcome required
+ *  - skip:true  → lead marked passed ("not needed"): leaves the queue and is not pulled back
  *  - otherwise  → outcome required; attached to the lead's latest call (or a
  *    standalone log row if no call was placed)
  */
@@ -20,7 +20,7 @@ export async function POST(req: Request) {
   if (!leadId) return NextResponse.json({ error: "leadId required" }, { status: 400 });
 
   if (body.skip) {
-    db.prepare("UPDATE leads SET status='skipped' WHERE id=?").run(leadId);
+    passLead(leadId);
   } else {
     const outcome = String(body.outcome || "");
     if (!OUTCOMES.has(outcome))
@@ -32,8 +32,14 @@ export async function POST(req: Request) {
       .get(leadId) as { id: number } | undefined;
     let callId: number;
     if (latest) {
-      db.prepare("UPDATE calls SET outcome=?, notes=?, ended_at=COALESCE(ended_at, datetime('now')) WHERE id=?")
-        .run(outcome, notes, latest.id);
+      // A call still in progress (same test as openCalls) stays open: the operator can log it and
+      // move on, then hang it up from the next lead's card. Hang up / the poller close it.
+      db.prepare(
+        `UPDATE calls SET outcome=?, notes=?,
+           ended_at=CASE WHEN ended_at IS NULL AND (vonage_uuid IS NOT NULL OR started_at > datetime('now', '-90 seconds'))
+                         THEN NULL ELSE COALESCE(ended_at, datetime('now')) END
+         WHERE id=?`
+      ).run(outcome, notes, latest.id);
       callId = latest.id;
     } else {
       callId = Number(
@@ -42,6 +48,7 @@ export async function POST(req: Request) {
       );
     }
     db.prepare("UPDATE leads SET status='done' WHERE id=?").run(leadId);
+    rememberWrapup(leadId);
     void syncCall(callId); // GHL push — fire-and-forget, never blocks the next lead
   }
 
