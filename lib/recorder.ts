@@ -9,21 +9,45 @@
 let ctx: AudioContext | null = null;
 let recorder: MediaRecorder | null = null;
 let micStream: MediaStream | null = null;
-let ownsMic = false;
 let chunks: Blob[] = [];
+/** Clones only. Stopping the sender's own track would mute the lead. */
+let owned: MediaStreamTrack[] = [];
+
+/**
+ * Web Audio must not attach to the track Twilio is sending. On this machine that
+ * tap makes the lead hear chopped, quiet audio. A clone keeps the sender direct.
+ */
+function cloned(t: MediaStreamTrack): MediaStreamTrack | null {
+  if (t.kind !== "audio" || t.readyState !== "live" || typeof t.clone !== "function") return null;
+  const copy = t.clone();
+  owned.push(copy);
+  return copy;
+}
+
+function releaseClones(): void {
+  for (const t of owned) {
+    try { t.stop(); } catch { /* clone already ended */ }
+  }
+  owned = [];
+  micStream = null;
+}
 
 export async function startCallRecording(): Promise<void> {
   if (recorder) return; // already rolling
   // The call already holds the mic. Opening another getUserMedia here is a second
   // echo-cancelled capture, and Chrome then silences the outbound audio.
   const sdkTrack = (window as any).__sdkMicTrack as MediaStreamTrack | undefined;
-  const liveMic = sdkTrack && sdkTrack.kind === "audio" && sdkTrack.readyState === "live" ? sdkTrack : undefined;
+  const liveMic = sdkTrack && sdkTrack.kind === "audio" && sdkTrack.readyState === "live" ? cloned(sdkTrack) : null;
   micStream = liveMic ? new MediaStream([liveMic]) : null;
-  ownsMic = false;
-  ctx = new AudioContext();
-  ctx.resume().catch(() => {});
-  const mix = ctx.createMediaStreamDestination();
-  if (micStream) ctx.createMediaStreamSource(micStream).connect(mix);
+  try {
+    try {
+      ctx = new AudioContext({ sampleRate: 48000 });
+    } catch {
+      ctx = new AudioContext();
+    }
+    ctx.resume().catch(() => {});
+    const mix = ctx.createMediaStreamDestination();
+    if (micStream) ctx.createMediaStreamSource(micStream).connect(mix);
 
   // Remote (prospect) audio. Primary source: the raw WebRTC tracks stashed by the
   // RTCPeerConnection patch in page.tsx — immune to <audio> srcObject swaps that made
@@ -32,9 +56,11 @@ export async function startCallRecording(): Promise<void> {
   const seen = new Set<string>();
   const addTrack = (t: MediaStreamTrack) => {
     if (!ctx || t.kind !== "audio" || t.readyState !== "live" || seen.has(t.id)) return;
+    const copy = cloned(t);
+    if (!copy) return;
     seen.add(t.id);
     try {
-      ctx.createMediaStreamSource(new MediaStream([t])).connect(mix);
+      ctx.createMediaStreamSource(new MediaStream([copy])).connect(mix);
     } catch {
       /* track not capturable — keep going with what we have */
     }
@@ -55,10 +81,17 @@ export async function startCallRecording(): Promise<void> {
     }
   }
 
-  chunks = [];
-  recorder = new MediaRecorder(mix.stream, { mimeType: "audio/webm;codecs=opus", audioBitsPerSecond: 32000 });
-  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-  recorder.start(1000);
+    chunks = [];
+    recorder = new MediaRecorder(mix.stream, { mimeType: "audio/webm;codecs=opus", audioBitsPerSecond: 32000 });
+    recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+    recorder.start(1000);
+  } catch (e) {
+    releaseClones();
+    ctx?.close().catch(() => {});
+    ctx = null;
+    recorder = null;
+    throw e;
+  }
 }
 
 /** Stop and upload to the call's audio endpoint. Resolves once the upload is sent. */
@@ -66,15 +99,16 @@ export async function stopCallRecording(callId: number): Promise<void> {
   const r = recorder;
   recorder = null;
   delete (window as any).__recorderAddTrack;
-  if (!r) return;
-  await new Promise<void>((resolve) => {
-    r.onstop = () => resolve();
-    r.state !== "inactive" ? r.stop() : resolve();
-  });
-  if (ownsMic) micStream?.getTracks().forEach((t) => t.stop()); // never stop the SDK's own track
-  micStream = null;
+  if (r) {
+    await new Promise<void>((resolve) => {
+      r.onstop = () => resolve();
+      r.state !== "inactive" ? r.stop() : resolve();
+    });
+  }
+  releaseClones();
   ctx?.close().catch(() => {});
   ctx = null;
+  if (!r) return;
 
   const blob = new Blob(chunks, { type: "audio/webm" });
   chunks = [];

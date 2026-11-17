@@ -6,6 +6,7 @@
  * (modifier combos like Ctrl/Cmd+C are ignored so copy/paste never triggers a shortcut)
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { meterMayCapture, voiceMicConstraints } from "@/lib/mic-capture";
 import { startCallRecording, stopCallRecording, recordingActive } from "@/lib/recorder";
 import { DEFAULT_TEMPLATES, fillTemplate, smsTarget, templateLang, type Lang, type Templates } from "@/lib/templates";
 
@@ -131,11 +132,9 @@ function ensureRemoteAudioPlayback() {
 }
 
 /**
- * The Vonage SDK captures from the browser DEFAULT mic with no input-device API.
- * Patch getUserMedia so capture honors the chosen mic. Echo cancellation stays on.
- * autoGainControl stays off: Chrome's AGC writes the headset volume, and PipeWire
- * rejects that write so the mic stays at 100%. The level meter passes its own
- * echoCancellation: false, which wins via `base`. Idempotent.
+ * The SDKs capture from the default mic. Pin every capture to the chosen mic,
+ * with echo cancellation and gain on, so a quiet headset is audible to the lead.
+ * Idempotent. The level meter must not be capturing at the same time — see claimMicForCall.
  */
 function logGum(ok: boolean, extra: { label?: string; name?: string; message?: string }) {
   fetch("/api/client-log", {
@@ -148,24 +147,14 @@ function logGum(ok: boolean, extra: { label?: string; name?: string; message?: s
 function applyMicConstraint() {
   const w = window as any;
   const md = navigator.mediaDevices;
-  if (w.__gumPatched === 3 || !md?.getUserMedia) return;
-  w.__gumPatched = 3;
+  // Bump when voiceMicConstraints changes. A live page keeps the old patch on window.
+  if (w.__gumPatched === 5 || !md?.getUserMedia) return;
+  w.__gumPatched = 5;
   const orig = md.getUserMedia.bind(md);
   const withMic = (constraints: MediaStreamConstraints, exact: boolean): MediaStreamConstraints => {
     if (!constraints.audio) return constraints;
-    const base = typeof constraints.audio === "object" ? constraints.audio : {};
-    const id = exact ? w.__micDeviceId : "";
-    return {
-      ...constraints,
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false,
-        channelCount: 1,
-        ...base,
-        ...(id ? { deviceId: { exact: id } } : {}),
-      },
-    };
+    const id = exact ? String(w.__micDeviceId || "") : "";
+    return { ...constraints, audio: voiceMicConstraints(id) };
   };
   md.getUserMedia = (constraints: MediaStreamConstraints = {}) => {
     const pinned = !!(constraints.audio && w.__micDeviceId);
@@ -292,11 +281,22 @@ export default function Cockpit() {
   const [outputDeviceId, setOutputDeviceId] = useState<string>(""); // chosen speaker (setSinkId)
   const diagRef = useRef<{
     raf?: number;
+    wait?: ReturnType<typeof setTimeout>;
     poll?: ReturnType<typeof setInterval>;
     micPoll?: ReturnType<typeof setInterval>;
     ac?: AudioContext;
     mic?: MediaStream;
+    /** True while a call owns the mic. Do not stop the sender track. */
+    borrowed?: boolean;
   }>({});
+  // Chrome sends the lead silence if getUserMedia runs twice on this mic. The call owns it.
+  const callMicOwnerRef = useRef(false);
+  const micEpochRef = useRef(0);
+  const meterGenRef = useRef(0);
+  const meterInflightRef = useRef<Promise<boolean> | null>(null);
+  const claimMicForCallRef = useRef<() => Promise<number>>(async () => 0);
+  const releaseMicAfterCallRef = useRef<(epoch: number) => void>(() => {});
+  const meterOutboundRef = useRef<(epoch: number) => void>(() => {});
   const flash = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(null), 5000);
@@ -858,11 +858,14 @@ export default function Cockpit() {
   const stopDiag = useCallback(() => {
     const d = diagRef.current;
     if (d.raf) cancelAnimationFrame(d.raf);
+    if (d.wait) clearTimeout(d.wait);
     if (d.poll) clearInterval(d.poll);
     if (d.micPoll) clearInterval(d.micPoll);
     d.ac?.close().catch(() => {});
-    d.mic?.getTracks().forEach((t) => t.stop());
+    if (!d.borrowed) d.mic?.getTracks().forEach((t) => t.stop());
     diagRef.current = {};
+    callMicOwnerRef.current = false;
+    micEpochRef.current += 1;
     const w = window as any;
     if (w.__micMeterRaf) cancelAnimationFrame(w.__micMeterRaf);
     if (w.__micMeterT) clearTimeout(w.__micMeterT);
@@ -882,26 +885,66 @@ export default function Cockpit() {
     if (a) { try { (a.srcObject as MediaStream | null)?.getTracks().forEach((t) => t.stop()); } catch {} a.remove(); }
   }, []);
 
-  /** Level meter. Raw capture, so the call keeps the mic's one echo-cancelled stream. */
+  /** Drop the meter's own capture. Never stops the track the call is sending. */
+  const releaseOwnedMic = useCallback(() => {
+    meterGenRef.current += 1;
+    const d = diagRef.current;
+    if (d.raf) cancelAnimationFrame(d.raf);
+    d.raf = undefined;
+    if (d.wait) clearTimeout(d.wait);
+    d.wait = undefined;
+    d.ac?.close().catch(() => {});
+    d.ac = undefined;
+    if (!d.borrowed) d.mic?.getTracks().forEach((t) => t.stop());
+    d.mic = undefined;
+    d.borrowed = false;
+  }, []);
+
+  /**
+   * Level meter before a call. Uses the same voice constraints as the call, and
+   * refuses to open a capture while the call already holds the mic.
+   */
   const startMicMeter = useCallback(async (): Promise<boolean> => {
+    if (!meterMayCapture(callMicOwnerRef.current)) return false;
+    const gen = ++meterGenRef.current;
     if (diagRef.current.raf) cancelAnimationFrame(diagRef.current.raf);
+    if (diagRef.current.wait) clearTimeout(diagRef.current.wait);
     diagRef.current.ac?.close().catch(() => {});
-    diagRef.current.mic?.getTracks().forEach((t) => t.stop());
-    const rawMic = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    if (!diagRef.current.borrowed) diagRef.current.mic?.getTracks().forEach((t) => t.stop());
+    diagRef.current.mic = undefined;
+    diagRef.current.borrowed = false;
+    diagRef.current.ac = undefined;
+    const box: { run?: Promise<boolean> } = {};
+    const run = (async (): Promise<boolean> => {
+      try {
+        return await openMeter(gen);
+      } finally {
+        if (meterInflightRef.current === box.run) meterInflightRef.current = null;
+      }
+    })();
+    box.run = run;
+    meterInflightRef.current = run;
+    return run;
+
+    async function openMeter(genAtStart: number): Promise<boolean> {
     try {
       applyMicConstraint();
       let mic: MediaStream;
       try {
-        mic = await navigator.mediaDevices.getUserMedia({ audio: rawMic });
+        mic = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch (err: any) {
         // A pinned mic (window.__micDeviceId) can go stale (reconnect / browser restart
         // rotates the deviceId) → exact-constraint throws. Fall back to the default mic.
         if ((window as any).__micDeviceId && /Overconstrained|NotFound|NotReadable/i.test(err?.name || "")) {
           (window as any).__micDeviceId = "";
           setMicDeviceId("");
-          mic = await navigator.mediaDevices.getUserMedia({ audio: rawMic });
+          mic = await navigator.mediaDevices.getUserMedia({ audio: true });
           setRtcDiag("🎤 chosen mic unavailable — using system default");
         } else throw err;
+      }
+      if (genAtStart !== meterGenRef.current || callMicOwnerRef.current) {
+        mic.getTracks().forEach((t) => t.stop());
+        return false;
       }
       setMicCaptureLabel(mic.getAudioTracks()[0]?.label || "Default mic");
       navigator.mediaDevices
@@ -932,15 +975,126 @@ export default function Cockpit() {
       setRtcDiag(`🎤 MIC BLOCKED (${e?.name || e}) — click the address-bar 🎙 icon → Allow, then End + Start line.`);
       return false;
     }
+    }
   }, []);
 
-  /** Pick the mic. The green bar follows at once. End + Start line to switch a live call. */
+  /** Stop the meter capture and keep it stopped until releaseMicAfterCall(epoch). */
+  const claimMicForCall = useCallback(async () => {
+    callMicOwnerRef.current = true;
+    const epoch = ++micEpochRef.current;
+    const pending = meterInflightRef.current;
+    releaseOwnedMic();
+    if (pending) await pending.catch(() => false);
+    releaseOwnedMic();
+    return epoch;
+  }, [releaseOwnedMic]);
+
+  const releaseMicAfterCall = useCallback((epoch: number) => {
+    if (epoch !== micEpochRef.current) return;
+    callMicOwnerRef.current = false;
+    void startMicMeter();
+  }, [startMicMeter]);
+
+  /**
+   * Green bar from the sender's audioLevel stat. Does not open a mic and does not
+   * run the sender track through Web Audio — that tap is what chopped the lead's side.
+   */
+  const meterOutbound = useCallback((epoch: number) => {
+    if (epoch !== micEpochRef.current) return;
+    diagRef.current.borrowed = true;
+    const tick = async () => {
+      if (epoch !== micEpochRef.current || !callMicOwnerRef.current) return;
+      const pcs = ((window as any).__rtcPcs as RTCPeerConnection[] | undefined) ?? [];
+      let level = 0;
+      let label = "";
+      for (const pc of pcs) {
+        const sender = pc.getSenders?.().find((s) => s.track?.kind === "audio" && s.track.readyState === "live");
+        if (sender?.track) {
+          sender.track.enabled = true;
+          label = sender.track.label || label;
+        }
+        if (pc.connectionState !== "connected") continue;
+        try {
+          const stats = await pc.getStats();
+          stats.forEach((s: any) => {
+            if (typeof s.audioLevel !== "number") return;
+            if (s.type === "media-source") level = Math.max(level, s.audioLevel);
+            else if (s.type === "outbound-rtp" && (s.kind === "audio" || s.mediaType === "audio")) level = Math.max(level, s.audioLevel);
+          });
+        } catch { /* pc gone mid-read */ }
+      }
+      if (epoch !== micEpochRef.current || !callMicOwnerRef.current) return;
+      if (label) setMicCaptureLabel(label);
+      setMicActive(true);
+      // audioLevel is linear RMS. Speech usually sits around 0.05–0.3.
+      setMicLevel(Math.min(100, Math.round(level * 400)));
+      diagRef.current.wait = setTimeout(tick, 100);
+    };
+    const find = () => {
+      if (epoch !== micEpochRef.current || !callMicOwnerRef.current) return;
+      const pcs = ((window as any).__rtcPcs as RTCPeerConnection[] | undefined) ?? [];
+      const live = pcs.some((pc) => pc.getSenders?.().some((s) => s.track?.kind === "audio" && s.track.readyState === "live"));
+      if (!live && !(window as any).__sdkMicTrack) {
+        diagRef.current.wait = setTimeout(find, 200);
+        return;
+      }
+      tick();
+      void probeOutbound(epoch);
+    };
+    find();
+
+    async function probeOutbound(epochAtStart: number) {
+      const read = async () => {
+        let bytes = 0;
+        const pcs = ((window as any).__rtcPcs as RTCPeerConnection[] | undefined) ?? [];
+        for (const pc of pcs) {
+          if (pc.connectionState !== "connected") continue;
+          const stats = await pc.getStats();
+          stats.forEach((s: any) => {
+            if (s.type === "outbound-rtp" && (s.kind === "audio" || s.mediaType === "audio")) bytes += s.bytesSent || 0;
+          });
+        }
+        return bytes;
+      };
+      const t0 = Date.now();
+      let before = 0;
+      let connected = false;
+      while (Date.now() - t0 < 8000) {
+        if (epochAtStart !== micEpochRef.current) return;
+        const pcs = ((window as any).__rtcPcs as RTCPeerConnection[] | undefined) ?? [];
+        if (pcs.some((pc) => pc.connectionState === "connected")) {
+          connected = true;
+          before = await read();
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!connected || epochAtStart !== micEpochRef.current) return;
+      await new Promise((r) => setTimeout(r, 2000));
+      if (epochAtStart !== micEpochRef.current) return;
+      const delta = (await read()) - before;
+      fetch("/api/client-log", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "mic-send", delta }),
+      }).catch(() => {});
+      // 0 bytes means the sender is dead. Silence still produces a little comfort-noise, so don't warn on a quiet start.
+      if (delta <= 0) flash("🔇 Mic is not reaching this call. End line, Start line, then call your own phone.");
+    }
+  }, [flash]);
+
+  claimMicForCallRef.current = claimMicForCall;
+  releaseMicAfterCallRef.current = releaseMicAfterCall;
+  meterOutboundRef.current = meterOutbound;
+
+  /** Pick the mic. The green bar follows at once. A live call keeps its current mic. */
   const selectMic = useCallback((id: string) => {
     setMicDeviceId(id);
     localStorage.setItem("dialer-mic", id);
     (window as any).__micDeviceId = id;
     applyMicConstraint();
-    if (diagRef.current.mic) startMicMeter();
+    if (callMicOwnerRef.current) return;
+    void startMicMeter();
   }, [startMicMeter]);
 
   /** Pick the speaker. Routes call audio (and any live remote-audio element) to it via setSinkId. */
@@ -984,6 +1138,7 @@ export default function Cockpit() {
     const arm = () => {
       const ac = diagRef.current.ac;
       if (ac?.state === "suspended") void ac.resume();
+      if (callMicOwnerRef.current) return;
       if (!diagRef.current.mic) void startMicMeter();
     };
     window.addEventListener("pointerdown", arm);
@@ -1053,14 +1208,17 @@ export default function Cockpit() {
       }
       const mod: any = await import("@vonage/client-sdk");
       const client = new mod.VonageClient();
+      const epoch = await claimMicForCallRef.current();
       await client.createSession(t.token);
       const callId = await client.serverCall(); // → answer webhook → joins the room, marks line live
       rtcRef.current = { client, callId };
+      meterOutboundRef.current(epoch);
       setConnDead(false);
       pollRemoteAudio();
     } catch (e: any) {
       setError(`Browser line failed: ${e?.message || e}. Is the tunnel running? (npm run tunnel)`);
       stopDiag();
+      void startMicMeter();
       fetch("/api/session/end", { method: "POST" }).catch(() => {});
     }
   }, [api, startMicMeter, pollRemoteAudio, stopDiag]);
@@ -1105,11 +1263,16 @@ export default function Cockpit() {
     if (!sess) return;
     stopRingTone();
     setRinging(null);
-    try {
-      sess.answer({ mediaConstraints: { audio: true, video: false } });
-    } catch (e: any) {
-      setError(`Answer failed: ${e?.message || e}`);
-    }
+    void claimMicForCallRef.current().then((epoch) => {
+      (sess as any).__micEpoch = epoch;
+      try {
+        sess.answer({ mediaConstraints: { audio: true, video: false } });
+        meterOutboundRef.current(epoch);
+      } catch (e: any) {
+        releaseMicAfterCallRef.current(epoch);
+        setError(`Answer failed: ${e?.message || e}`);
+      }
+    });
   }, [stopRingTone]);
 
   const declineInbound = useCallback(() => {
@@ -1178,6 +1341,11 @@ export default function Cockpit() {
         const drop = () => {
           elksSessionsRef.current.delete(sess);
           if (elksRtcRef.current.session === sess) elksRtcRef.current.session = null;
+          const epoch = (sess as any).__micEpoch as number | undefined;
+          if (epoch != null) {
+            (sess as any).__micEpoch = undefined;
+            releaseMicAfterCallRef.current(epoch);
+          }
         };
         sess.on("failed", drop);
         sess.on("peerconnection", (ev: any) => {
@@ -1205,7 +1373,15 @@ export default function Cockpit() {
           const ours = fromUser === String(creds.number).replace(/\D/g, "");
           if (Date.now() < expectOutboundUntilRef.current || ours) {
             expectOutboundUntilRef.current = 0;
-            sess.answer({ mediaConstraints: { audio: true, video: false } });
+            void claimMicForCallRef.current().then((epoch) => {
+              (sess as any).__micEpoch = epoch;
+              try {
+                sess.answer({ mediaConstraints: { audio: true, video: false } });
+                meterOutboundRef.current(epoch);
+              } catch {
+                releaseMicAfterCallRef.current(epoch);
+              }
+            });
           } else {
             // Real inbound caller: ring in the cockpit until Answer / Decline / caller hangs up.
             ringSessRef.current = sess;
@@ -1235,6 +1411,7 @@ export default function Cockpit() {
     } catch (e: any) {
       setError(e?.message || "46elks browser line failed");
       stopDiag();
+      void startMicMeter();
       try {
         elksRtcRef.current.ua?.stop();
       } catch {}
@@ -1256,7 +1433,14 @@ export default function Cockpit() {
       if (leaked && leaked !== twilioRef.current.device) {
         try { leaked.destroy(); } catch {}
       }
-      const device = new Device(t.token, { codecPreferences: ["opus", "pcmu"] as any, closeProtection: true });
+      // Frankfurt then Dublin: the line is in Sweden. A far Twilio edge is what
+      // makes a lead hear the voice cut out. Opus stays first; dscp marks the voice packets.
+      const device = new Device(t.token, {
+        codecPreferences: ["opus", "pcmu"] as any,
+        closeProtection: true,
+        dscp: true,
+        edge: ["frankfurt", "dublin"],
+      });
       (window as any).__rapiddialTwilio = device;
       const calls = twilioRef.current.calls;
       device.on("incoming", (c: any) => {
@@ -1309,6 +1493,7 @@ export default function Cockpit() {
     } catch (e: any) {
       setError(e?.message || "Twilio browser line failed");
       stopDiag();
+      void startMicMeter();
       try {
         twilioRef.current.device?.destroy();
       } catch {}
@@ -1391,7 +1576,8 @@ export default function Cockpit() {
       twilioRef.current = { device: null, calls: new Set() };
     }
     api("/api/session/end").then(refresh).catch(() => {});
-  }, [api, refresh, stopDiag]);
+    void startMicMeter();
+  }, [api, refresh, stopDiag, startMicMeter]);
   /**
    * Audio line check — the "solid state" guarantee. Server dials a TTS leg into the room
    * (the exact path a prospect's voice takes); we measure (a) HEAR: peak RMS on the remote
@@ -1521,38 +1707,57 @@ export default function Cockpit() {
       await fetch("/api/hangup", { method: "POST" }).catch(() => {});
       return;
     }
+    // Release the level-meter mic before Twilio captures. A second open capture
+    // is what made leads hear silence while the recording still had speech.
+    const epoch = await claimMicForCall();
+    const giveBack = () => releaseMicAfterCall(epoch);
+    try {
+      const { Device } = await import("@twilio/voice-sdk");
+      const ctx = Device.audioContext;
+      if (ctx?.state === "suspended") await ctx.resume();
+    } catch {}
     const params = { dbCallId: String(callId) };
     let conn: any;
     try {
       conn = await device.connect({ params });
     } catch (e: any) {
       const message = e?.message || "Browser could not place the call";
-      if (!/already active/i.test(String(message))) return fail(message);
+      if (!/already active/i.test(String(message))) {
+        giveBack();
+        return fail(message);
+      }
       try { device.disconnectAll(); } catch {}
       try {
         conn = await device.connect({ params });
       } catch (e2: any) {
+        giveBack();
         return fail(e2?.message || message);
       }
     }
     if (cancelledDialRef.current) {
       try { conn.disconnect(); } catch {}
       await fetch("/api/hangup", { method: "POST" }).catch(() => {});
+      giveBack();
       return;
     }
     twilioRef.current.calls.add(conn);
     const drop = () => twilioRef.current.calls.delete(conn);
-    for (const ev of ["disconnect", "cancel", "reject", "error"]) conn.on(ev, drop);
+    const ended = () => {
+      drop();
+      giveBack();
+    };
+    for (const ev of ["disconnect", "cancel", "reject"]) conn.on(ev, ended);
     conn.on("error", (e: any) => {
       const message = `${e?.code ? e.code + " " : ""}${e?.message || e}`;
       log(false, message);
       setError(`Twilio: ${message}`);
       fetch("/api/hangup", { method: "POST" }).catch(() => {});
     });
+    meterOutbound(epoch);
     for (const ev of ["ringing", "accept", "disconnect", "cancel"]) {
       conn.on(ev, () => log(true, ev));
     }
-  }, []);
+  }, [claimMicForCall, meterOutbound, releaseMicAfterCall]);
   /**
    * P only fires with no call active, so any 46elks SIP session the browser still holds is a
    * leftover (missed BYE, call ended on the server). Left alone it makes the browser reject the
