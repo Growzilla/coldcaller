@@ -35,8 +35,11 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 # dialer: local state + telephony secrets
-data/
+# data/dialer.db is tracked so a clone has the lead queue.
+# Recordings, backups, and WAL files stay on this machine.
+data/*
+!data/dialer.db
 secrets/
 .env.local
 .playwright-mcp/
-dialer.db*
+/dialer.db*
